@@ -6,6 +6,8 @@ import subprocess
 import sys
 import tempfile
 import os
+import threading
+import queue
 
 
 def run():
@@ -13,9 +15,13 @@ def run():
     root.title("CodeForge")
     root.geometry("800x600")
 
+    # Top area: editor (left) + output panel (right), side by side
+    top_frame = tk.Frame(root)
+    top_frame.pack(fill="both", expand=True, side="top")
+
     # Frame to hold line numbers + text area side by side
-    editor_frame = tk.Frame(root)
-    editor_frame.pack(fill="both", expand=True)
+    editor_frame = tk.Frame(top_frame)
+    editor_frame.pack(fill="both", expand=True, side="left")
 
     line_numbers = tk.Text(
         editor_frame, width=4, padx=4, takefocus=0, border=0,
@@ -27,17 +33,204 @@ def run():
     text_area = tk.Text(editor_frame, wrap="none", undo=True, font=("Consolas", 12))
     text_area.pack(side="left", fill="both", expand=True)
 
-    # Output panel for run results
-    output_frame = tk.Frame(root)
-    output_frame.pack(fill="x", side="bottom")
+    text_scrollbar = tk.Scrollbar(editor_frame, command=text_area.yview)
+    text_scrollbar.pack(side="left", fill="y")
+
+    def on_text_scroll(first, last):
+        # Keeps the scrollbar and the line-number gutter in sync with
+        # whatever moved the editor's viewport (wheel, keys, drag, resize).
+        text_scrollbar.set(first, last)
+        line_numbers.yview_moveto(float(first))
+
+    text_area.config(yscrollcommand=on_text_scroll)
+
+    def on_linenum_scroll(event):
+        # Let scrolling while hovered over the gutter also scroll the editor.
+        text_area.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        return "break"
+
+    line_numbers.bind("<MouseWheel>", on_linenum_scroll)
+
+    # Output panel for run results (now docked on the right)
+    output_frame = tk.Frame(top_frame, width=300)
+    output_frame.pack(fill="y", side="right")
+    output_frame.pack_propagate(False)
 
     output_label = tk.Label(output_frame, text="Output", anchor="w", background="#333333", foreground="white")
     output_label.pack(fill="x")
 
-    output_area = tk.Text(output_frame, height=10, font=("Consolas", 10), background="#1e1e1e", foreground="#dcdcdc", state="disabled")
-    output_area.pack(fill="x")
+    output_area = tk.Text(output_frame, font=("Consolas", 10), background="#1e1e1e", foreground="#dcdcdc", state="disabled", wrap="word")
+    output_area.pack(fill="both", expand=True)
+
+    # Terminal panel, docked below the editor/output row
+    terminal_frame = tk.Frame(root, height=180)
+    terminal_frame.pack(fill="x", side="bottom")
+    terminal_frame.pack_propagate(False)
+
+    terminal_label = tk.Label(terminal_frame, text="Terminal", anchor="w", background="#333333", foreground="white")
+    terminal_label.pack(fill="x")
+
+    terminal_output = tk.Text(
+        terminal_frame, font=("Consolas", 10), background="#0c0c0c", foreground="#00ff00",
+        state="disabled", wrap="word", borderwidth=0, highlightthickness=0
+    )
+    terminal_output.pack(fill="both", expand=True)
+
+    # Thin separator so the input row doesn't visually merge with the output above it
+    terminal_divider = tk.Frame(terminal_frame, background="#333333", height=1)
+    terminal_divider.pack(fill="x", side="bottom")
+
+    terminal_input_frame = tk.Frame(terminal_frame, background="#1a1a1a", height=28)
+    terminal_input_frame.pack(fill="x", side="bottom")
+    terminal_input_frame.pack_propagate(False)
+
+    terminal_prompt = tk.Label(terminal_input_frame, text="$", background="#1a1a1a", foreground="#00ff00", font=("Consolas", 10))
+    terminal_prompt.pack(side="left", padx=(4, 0))
+
+    terminal_entry = tk.Entry(
+        terminal_input_frame, font=("Consolas", 10), background="#1a1a1a", foreground="#00ff00",
+        insertbackground="#00ff00", relief="flat", borderwidth=0, highlightthickness=1,
+        highlightbackground="#333333", highlightcolor="#00ff00"
+    )
+    terminal_entry.pack(side="left", fill="x", expand=True, padx=4, pady=4)
 
     current_file = {"path": None}
+
+    def append_terminal(text):
+        terminal_output.config(state="normal")
+        terminal_output.insert(tk.END, text)
+        terminal_output.see(tk.END)
+        terminal_output.config(state="disabled")
+
+    # ---------- Live PowerShell session ----------
+    # Instead of spawning a throwaway process per command (which loses cwd,
+    # env vars, PS functions/aliases, etc. between commands), we launch a
+    # single persistent PowerShell process and keep it alive for the life of
+    # the window. Commands are written to its stdin; a background thread
+    # continuously drains its stdout/stderr into a queue, which the Tk main
+    # loop polls and renders. This is what lets `cd`, `$env:X = ...`,
+    # virtualenv activation, etc. actually persist the way a real terminal
+    # window would.
+    shell_state = {"proc": None, "alive": False}
+    shell_output_queue = queue.Queue()
+
+    def start_shell():
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        shell_cmd = ["powershell.exe", "-NoLogo", "-NoExit", "-Command", "-"] \
+            if os.name == "nt" else ["/bin/bash"]
+        try:
+            proc = subprocess.Popen(
+                shell_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                cwd=os.getcwd(),
+                creationflags=creationflags,
+            )
+        except FileNotFoundError:
+            append_terminal("Error: could not find a shell to launch (powershell.exe / bash).\n")
+            return None
+
+        shell_state["proc"] = proc
+        shell_state["alive"] = True
+
+        def reader():
+            try:
+                for line in iter(proc.stdout.readline, ""):
+                    shell_output_queue.put(line)
+            except (ValueError, OSError):
+                pass
+            shell_state["alive"] = False
+            shell_output_queue.put(None)  # sentinel: shell exited
+
+        threading.Thread(target=reader, daemon=True).start()
+        return proc
+
+    def poll_shell_output():
+        try:
+            while True:
+                line = shell_output_queue.get_nowait()
+                if line is None:
+                    append_terminal("\n[shell session ended]\n")
+                else:
+                    append_terminal(line)
+        except queue.Empty:
+            pass
+        root.after(40, poll_shell_output)
+
+    start_shell()
+    append_terminal("CodeForge terminal ready (live PowerShell session).\n")
+    poll_shell_output()
+
+    def restart_shell():
+        old = shell_state["proc"]
+        if old is not None:
+            try:
+                old.kill()
+            except Exception:
+                pass
+        start_shell()
+        append_terminal("\n[shell restarted]\n")
+
+    def run_terminal_command(event=None):
+        command = terminal_entry.get()
+        terminal_entry.delete(0, tk.END)
+        append_terminal(f"PS> {command}\n")
+
+        if not command.strip():
+            return
+
+        stripped = command.strip().lower()
+
+        if stripped in ("clear", "cls"):
+            terminal_output.config(state="normal")
+            terminal_output.delete("1.0", tk.END)
+            terminal_output.config(state="disabled")
+            return
+
+        if stripped == "codeforge-restart-shell":
+            restart_shell()
+            return
+
+        proc = shell_state["proc"]
+        if proc is None or not shell_state["alive"]:
+            append_terminal("Shell is not running. Type 'codeforge-restart-shell' to relaunch it.\n")
+            return
+
+        try:
+            proc.stdin.write(command + "\n")
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            shell_state["alive"] = False
+            append_terminal("Error: lost connection to the shell process. Type 'codeforge-restart-shell' to relaunch it.\n")
+
+    def shutdown_shell():
+        proc = shell_state["proc"]
+        if proc is not None:
+            try:
+                proc.stdin.write("exit\n")
+                proc.stdin.flush()
+            except Exception:
+                pass
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    terminal_entry.bind("<Return>", run_terminal_command)
+
+    def focus_terminal_entry(event=None):
+        terminal_entry.focus_set()
+        terminal_entry.icursor(tk.END)
+
+    # Clicking anywhere in the terminal panel (output area, label, or the
+    # panel background) sends focus to the actual input row, since it's easy
+    # to click the read-only output area by mistake and think nothing responds.
+    terminal_output.bind("<Button-1>", lambda e: root.after(1, focus_terminal_entry))
+    terminal_label.bind("<Button-1>", focus_terminal_entry)
+    terminal_frame.bind("<Button-1>", focus_terminal_entry)
 
     # ---------- Line numbers ----------
     def update_line_numbers(event=None):
@@ -104,7 +297,6 @@ def run():
         highlight_syntax()
 
     text_area.bind("<KeyRelease>", on_key_release)
-    text_area.bind("<MouseWheel>", lambda e: root.after(1, update_line_numbers))
 
     # ---------- File operations ----------
     def new_file():
@@ -187,8 +379,15 @@ def run():
     file_menu.add_command(label="Save", command=save_file, accelerator="Ctrl+S")
     file_menu.add_command(label="Save As", command=save_as_file)
     file_menu.add_separator()
-    file_menu.add_command(label="Exit", command=root.quit)
+
+    def on_exit():
+        shutdown_shell()
+        root.quit()
+
+    file_menu.add_command(label="Exit", command=on_exit)
     menu_bar.add_cascade(label="File", menu=file_menu)
+
+    root.protocol("WM_DELETE_WINDOW", on_exit)
 
     run_menu = tk.Menu(menu_bar, tearoff=0)
     run_menu.add_command(label="Run", command=run_code, accelerator="F5")
@@ -204,5 +403,24 @@ def run():
     setup_highlight_tags()
     update_line_numbers()
     highlight_syntax()
+
+    # Windows sometimes never issues an initial paint for nested custom-
+    # colored Frames (like the terminal's "$" prompt row) — a long-standing
+    # Tk/Windows quirk. A same-size resize can get silently coalesced by
+    # Windows and do nothing, so instead we minimize and immediately restore
+    # the window once at startup; that forces a real, full repaint from the
+    # OS rather than just a Tk-side layout recompute.
+    def force_repaint():
+        terminal_divider.lift()
+        terminal_input_frame.lift()
+        terminal_prompt.lift()
+        terminal_entry.lift()
+        root.update_idletasks()
+        root.iconify()
+        root.after(50, root.deiconify)
+        root.after(100, root.focus_force)
+        root.after(110, terminal_entry.focus_set)
+
+    root.after(150, force_repaint)
 
     root.mainloop()
