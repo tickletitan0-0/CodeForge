@@ -28,7 +28,8 @@ try:
         load_session, save_session,
         load_font_size_preference, save_font_size_preference,
         DEFAULT_FONT_SIZE, MIN_FONT_SIZE, MAX_FONT_SIZE,
-        is_dark_theme
+        is_dark_theme,
+        load_recent_files, save_recent_files, MAX_RECENT_FILES
     )
 except ImportError:
     # app.py is being run directly as a standalone script - fall back to a
@@ -39,7 +40,8 @@ except ImportError:
         load_session, save_session,
         load_font_size_preference, save_font_size_preference,
         DEFAULT_FONT_SIZE, MIN_FONT_SIZE, MAX_FONT_SIZE,
-        is_dark_theme
+        is_dark_theme,
+        load_recent_files, save_recent_files, MAX_RECENT_FILES
     )
 
 try:
@@ -52,6 +54,25 @@ try:
 except ImportError:
     pty = None
 
+try:
+    # Optional dependency (pip install tkinterdnd2) that lets the OS file
+    # manager drag files/folders straight onto the app. Root has to be a
+    # tkinterdnd2.TkinterDnD.Tk() (not a plain tk.Tk()) for drop targets to
+    # work at all, so run() below picks the right constructor based on
+    # whether this import succeeded. Falls back to no drag-and-drop
+    # (open via File > Open still works normally) if it isn't installed.
+    import tkinterdnd2
+except ImportError:
+    tkinterdnd2 = None
+
+try:
+    # music_player.py is being imported as part of the "editor" package.
+    from . import music_player
+except ImportError:
+    # Standalone script - plain import, same fallback pattern as themes
+    # above.
+    import music_player
+
 
 # ---------------- Theme ----------------
 # The palettes themselves now live in themes.py. We just load whichever one
@@ -59,6 +80,19 @@ except ImportError:
 # consistent theme.
 THEME_NAME = load_theme_preference()
 THEME = THEMES[THEME_NAME]
+
+
+def _scanline_bg():
+    """A background color for the CRT scanline bands: a small nudge away
+    from the editor background (lighter on a dark theme, darker on a light
+    one) so alternating lines read as a faint raster instead of being
+    invisible on one theme and jarring on another."""
+    hex_color = THEME["editor_bg"].lstrip("#")
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+    luminance = 0.299 * r + 0.587 * g + 0.114 * b
+    step = 14 if luminance < 128 else -10
+    r, g, b = (max(0, min(255, c + step)) for c in (r, g, b))
+    return f"#{r:02x}{g:02x}{b:02x}"
 
 
 def _apply_windows_dpi_awareness():
@@ -490,7 +524,7 @@ def _maximize_window(root):
 def run():
     _apply_windows_dpi_awareness()
 
-    root = tk.Tk()
+    root = tkinterdnd2.TkinterDnD.Tk() if tkinterdnd2 else tk.Tk()
     root.title("CodeForge")
     root.geometry("800x600")  # fallback size if maximizing isn't supported
     _maximize_window(root)
@@ -633,6 +667,31 @@ def run():
     )
     status_position_label.pack(side="left")
 
+    # Mirrors whatever's loaded in the Music tab so you can see/skip
+    # tracks without switching off the tab you're actually working in.
+    # Text and click-to-focus-tab binding are wired up once the Music tab
+    # itself exists further down in run().
+    status_music_label = tk.Label(
+        status_bar,
+        text="",
+        bg=THEME["panel_header_bg"],
+        fg=THEME["panel_header_fg"],
+        anchor="w",
+        padx=10,
+        cursor="hand2"
+    )
+    status_music_label.pack(side="left")
+
+    status_focus_label = tk.Label(
+        status_bar,
+        text="",
+        bg=THEME["panel_header_bg"],
+        fg=THEME["accent"],
+        anchor="w",
+        padx=10
+    )
+    status_focus_label.pack(side="left")
+
     status_filetype_label = tk.Label(
         status_bar,
         text="Plain Text",
@@ -750,16 +809,75 @@ def run():
     def current_editor_font():
         return ("Consolas", font_state["size"])
 
+    # Recently-opened files, most-recent first - persisted so "Open Recent"
+    # survives a restart. Kept in a dict (like font_state) so nested
+    # functions can mutate the list without `nonlocal`.
+    recent_files_state = {"paths": load_recent_files()}
+
     # Minimap - a zoomed-out overview of the whole file for quick
     # navigation, shared on/off state so new tabs match whatever the user
     # last chose.
     MINIMAP_WIDTH = 100
     minimap_state = {"visible": True}
+    # Fixed pixel height for every line-bar in the minimap - like VS Code/
+    # Sublime, a line is always a thin mark. row_height used to be
+    # canvas_h / row_count, which *stretched* each row to fill the whole
+    # strip vertically - fine for a long file, but on a short one it blew
+    # each line up into a tall, chunky block instead of leaving the rest
+    # of the strip empty underneath.
+    MINIMAP_ROW_HEIGHT = 3
+
+    # CRT Scanlines - off by default so it doesn't surprise anyone who
+    # just picks the CRT theme for the colors. Shared across tabs like
+    # minimap_state, for the same reason (new tabs need to match whatever
+    # was last chosen).
+    crt_state = {"scanlines": False}
 
     # ---------------- Output / Terminal panel ----------------
 
     output_frame = tk.Frame(main_frame, width=300, bg=THEME["app_bg"], highlightthickness=0, bd=0)
     output_frame.pack_propagate(False)
+
+    # Toolbar row above the Output/Terminal tabs - quick access to the
+    # three actions you'd otherwise have to dig into the Run menu for.
+    # Defined here (before run_code/kill_running/clear_terminal exist)
+    # is fine: the button `command` lambdas only look those names up when
+    # actually clicked, by which point run() has finished defining them.
+    terminal_toolbar_opts = {
+        "bg": THEME["panel_header_bg"],
+        "fg": THEME["panel_header_fg"],
+        "activebackground": THEME["editor_select_bg"],
+        "activeforeground": THEME["editor_select_fg"],
+        "relief": "flat",
+        "bd": 0,
+        "highlightthickness": 0,
+        "padx": 8,
+        "pady": 3,
+        "cursor": "hand2",
+    }
+    terminal_toolbar = tk.Frame(output_frame, bg=THEME["panel_header_bg"], highlightthickness=0, bd=0)
+    terminal_toolbar.pack(side="top", fill="x")
+
+    run_button = tk.Button(
+        terminal_toolbar, text="\u25B6 Run", command=lambda: run_code(),
+        **terminal_toolbar_opts
+    )
+    run_button.pack(side="left")
+
+    kill_button = tk.Button(
+        terminal_toolbar, text="\u25A0 Kill", command=lambda: kill_running(),
+        **terminal_toolbar_opts
+    )
+    kill_button.pack(side="left")
+
+    clear_button = tk.Button(
+        terminal_toolbar, text="\u2716 Clear", command=lambda: clear_terminal(),
+        **terminal_toolbar_opts
+    )
+    clear_button.pack(side="left")
+
+    toolbar_divider = tk.Frame(output_frame, bg=THEME["border"], height=1)
+    toolbar_divider.pack(side="top", fill="x")
 
     bottom_panel = ttk.Notebook(output_frame)
     bottom_panel.pack(fill="both", expand=True)
@@ -821,6 +939,30 @@ def run():
     terminal_area.config(yscrollcommand=terminal_scrollbar.set)
     terminal_area.tag_configure("term_error", foreground=THEME["syntax_string"])
     terminal_area.tag_configure("term_muted", foreground=THEME["muted_fg"])
+
+    # ---- Music tab (background YouTube playlist player) ----
+    # Fully optional - degrades to an install hint if yt-dlp/python-vlc
+    # aren't present, same graceful-fallback pattern as winpty/pty/
+    # tkinterdnd2 above. Placed after Terminal so the notebook reads
+    # Output / Terminal / Music left to right.
+    music_tab = tk.Frame(bottom_panel, bg=THEME["output_bg"])
+    bottom_panel.add(music_tab, text="\u266A Music")
+
+    def _update_music_status_label(title, is_playing):
+        if title:
+            icon = "\u266A" if is_playing else "\u23F8"
+            status_music_label.config(text=f"{icon} {title}")
+        else:
+            status_music_label.config(text="")
+
+    music_controls = music_player.build_music_panel(
+        music_tab, THEME, on_track_change=_update_music_status_label
+    )
+
+    def _focus_music_tab(event=None):
+        bottom_panel.select(music_tab)
+
+    status_music_label.bind("<Button-1>", _focus_music_tab)
 
     main_frame.add(output_frame, width=300, minsize=150, stretch="never")
 
@@ -1326,6 +1468,27 @@ def run():
         except Exception:
             pass
 
+    def kill_running():
+        """Send an interrupt (Ctrl+C) into the live shell - the same thing
+        pressing Ctrl+C in the Terminal tab does. Stops whatever's
+        currently running (a "Run", or anything typed directly into the
+        terminal) without tearing down the shell process itself. Harmless
+        no-op if the shell is just sitting idle at a prompt."""
+        if terminal_state["alive"]:
+            _term_send_raw("\x03")
+
+    def clear_terminal():
+        """Wipe the visible Output and Terminal panels. This only clears
+        what's on screen - the shell process itself (its cwd, environment,
+        and command history) keeps running untouched, exactly like a real
+        terminal's own "clear" command."""
+        terminal_area.delete("1.0", "end")
+        terminal_area.mark_set("term_cursor", "1.0")
+        terminal_area.mark_gravity("term_cursor", "left")
+        output_area.config(state="normal")
+        output_area.delete("1.0", tk.END)
+        output_area.config(state="disabled")
+
     # Every keystroke is forwarded raw to the shell; the widget's own
     # editing/self-insert is always suppressed ("break") so the buffer only
     # ever shows what the shell itself echoes back - keeping it byte-for-byte
@@ -1452,6 +1615,15 @@ def run():
         # Find/replace highlights - all matches, and the one currently selected.
         text_area.tag_configure("search_match", background=THEME["search_match_bg"])
         text_area.tag_configure("search_current", background=THEME["search_current_bg"])
+
+        # Faint banding on every other line - the "CRT Scanlines" View menu
+        # toggle turns this on/off. Configured here (colors baked in at
+        # creation like every other tag) but only ever *applied* to text
+        # when the toggle is on, in apply_crt_scanlines() below. Lowered
+        # last so it always sits underneath current_line/selection/syntax
+        # colors instead of muddying them.
+        text_area.tag_configure("crt_scanline", background=_scanline_bg())
+        text_area.tag_lower("crt_scanline")
 
     def highlight_current_line(text_area):
         text_area.tag_remove("current_line", "1.0", tk.END)
@@ -1642,10 +1814,27 @@ def run():
             # guide from before would keep showing after it should've gone.
             _hide_unused_guides(editor)
 
+    def apply_crt_scanlines(editor):
+        # Bands every other logical line. Tags stay attached to whichever
+        # characters they were applied to as text shifts around, so unlike
+        # a "paint pixel row N" overlay this needs recomputing after every
+        # edit (not just on toggle/theme change) or the banding would drift
+        # out of odd/even sync with the visible lines - which is exactly
+        # why this is called from highlight_syntax, the existing per-edit
+        # hook, rather than wired up separately.
+        text_area = editor["text"]
+        text_area.tag_remove("crt_scanline", "1.0", tk.END)
+        if not crt_state["scanlines"]:
+            return
+        line_count = int(text_area.index("end-1c").split(".")[0])
+        for line in range(2, line_count + 1, 2):
+            text_area.tag_add("crt_scanline", f"{line}.0", f"{line}.0+1line")
+
     def highlight_syntax(editor):
         text_area = editor["text"]
         for tag in ("keyword", "string", "comment", "number", "function"):
             text_area.tag_remove(tag, "1.0", tk.END)
+        apply_crt_scanlines(editor)
 
         profile = _get_syntax_profile(editor.get("path"))
         if not profile:
@@ -1689,12 +1878,14 @@ def run():
         if canvas_w <= 1 or canvas_h <= 1 or total_lines == 0:
             return
 
-        # One "row" per available pixel once there are more source lines
-        # than the minimap has height for; each row then represents a
-        # small bucket of lines rather than a single one, so the whole
-        # file is always represented top-to-bottom regardless of length.
-        row_count = max(1, min(total_lines, canvas_h))
-        row_height = canvas_h / row_count
+        # A row is always MINIMAP_ROW_HEIGHT tall, like a real minimap - it
+        # never stretches to fill the strip. Once there are more source
+        # lines than fit at that height, each row instead represents a
+        # bucket of several lines, so a long file still gets compressed to
+        # fit top-to-bottom; a short file just leaves the rest blank.
+        row_height = MINIMAP_ROW_HEIGHT
+        max_rows = max(1, int(canvas_h / row_height))
+        row_count = min(total_lines, max_rows)
         lines_per_row = total_lines / row_count
 
         longest = max((len(line.rstrip()) for line in lines if line.strip()), default=0)
@@ -1733,7 +1924,7 @@ def run():
             width = min(canvas_w - 6, max(2, max_len * scale))
             y = row * row_height
             canvas.create_rectangle(
-                3, y, 3 + width, y + max(1.0, row_height),
+                3, y, 3 + width, y + row_height,
                 fill=color, outline="", tags="bars"
             )
 
@@ -2670,6 +2861,7 @@ def run():
         mark_clean(editor)
         update_status_bar(editor)
         refresh_tree()
+        _remember_recent_file(path)
 
     def prompt_save_if_dirty(editor, tab_id):
         """Returns True if it's OK to proceed (close/exit), False to abort."""
@@ -2797,9 +2989,18 @@ def run():
         if not tab_id:
             return
 
+        editor = tab_editors.get(tab_id)
         tab_context_menu.delete(0, tk.END)
         tab_context_menu.add_command(label="Close Tab", command=lambda: close_tab(tab_id))
         tab_context_menu.add_command(label="Close Other Tabs", command=lambda: close_other_tabs(tab_id))
+        if editor and editor["path"]:
+            tab_context_menu.add_separator()
+            tab_context_menu.add_command(
+                label="Copy Path", command=lambda: copy_path(editor["path"])
+            )
+            tab_context_menu.add_command(
+                label="Copy Relative Path", command=lambda: copy_relative_path(editor["path"])
+            )
         tab_context_menu.tk_popup(event.x_root, event.y_root)
 
     tab_control.bind("<Button-3>", show_tab_context_menu)
@@ -2836,10 +3037,24 @@ def run():
         except OSError:
             messagebox.showerror("New Window", "Couldn't open a new window.")
 
+    def _remember_recent_file(path):
+        """Push path to the front of the recent-files list (de-duping any
+        earlier entry for it), cap it, persist it, and refresh the Open
+        Recent submenu so it reflects the change immediately."""
+        if not path:
+            return
+        paths = recent_files_state["paths"]
+        paths[:] = [p for p in paths if p != path]
+        paths.insert(0, path)
+        del paths[MAX_RECENT_FILES:]
+        save_recent_files(paths)
+        _rebuild_recent_files_menu()
+
     def _open_path_in_tab(path):
         existing_tab = find_tab_for_path(path)
         if existing_tab:
             tab_control.select(existing_tab)
+            _remember_recent_file(path)
             return
 
         with open(path, "r", encoding="utf-8") as f:
@@ -2864,6 +3079,7 @@ def run():
             highlight_active_file()
         else:
             create_tab(path=path, content=content)
+        _remember_recent_file(path)
 
     def open_file():
         path = filedialog.askopenfilename(
@@ -2957,6 +3173,34 @@ def run():
         project_path = folder
         populate_tree(folder)
         highlight_active_file()
+
+    # ---------- Drag and drop ----------
+    # Only active when tkinterdnd2 is installed (see the optional import at
+    # the top of this file) - root is a plain tk.Tk() otherwise, which has
+    # no drop_target_register/dnd_bind at all, so this whole block is
+    # skipped rather than erroring.
+    def _on_files_dropped(event):
+        nonlocal project_path
+        try:
+            paths = root.tk.splitlist(event.data)
+        except tk.TclError:
+            return
+        for dropped_path in paths:
+            if os.path.isdir(dropped_path):
+                project_path = dropped_path
+                populate_tree(dropped_path)
+                highlight_active_file()
+            elif os.path.isfile(dropped_path):
+                try:
+                    _open_path_in_tab(dropped_path)
+                except (OSError, UnicodeDecodeError) as e:
+                    messagebox.showerror("Open", f"Couldn't open {dropped_path}: {e}")
+
+    if tkinterdnd2:
+        tab_control.drop_target_register(tkinterdnd2.DND_FILES)
+        tab_control.dnd_bind("<<Drop>>", _on_files_dropped)
+        project_tree.drop_target_register(tkinterdnd2.DND_FILES)
+        project_tree.dnd_bind("<<Drop>>", _on_files_dropped)
 
     # ---------- Explorer: refresh helpers ----------
     # Rebuilding the whole tree from disk (rather than surgically
@@ -3157,6 +3401,21 @@ def run():
         except Exception as e:
             messagebox.showerror("Reveal", f"Couldn't open file explorer: {e}")
 
+    def _copy_to_clipboard(text):
+        root.clipboard_clear()
+        root.clipboard_append(text)
+
+    def copy_path(target_path):
+        _copy_to_clipboard(os.path.normpath(target_path))
+
+    def copy_relative_path(target_path):
+        base = project_path or os.path.dirname(target_path)
+        try:
+            rel = os.path.relpath(target_path, base)
+        except ValueError:
+            rel = target_path  # e.g. different drive on Windows
+        _copy_to_clipboard(rel.replace(os.sep, "/"))
+
     def show_tree_context_menu(event):
         if project_path is None:
             return  # nothing open yet - nowhere to create/rename/delete
@@ -3193,6 +3452,13 @@ def run():
         tree_context_menu.add_command(
             label="Reveal in File Explorer",
             command=lambda: reveal_in_file_explorer(target_path)
+        )
+        tree_context_menu.add_separator()
+        tree_context_menu.add_command(
+            label="Copy Path", command=lambda: copy_path(target_path)
+        )
+        tree_context_menu.add_command(
+            label="Copy Relative Path", command=lambda: copy_relative_path(target_path)
         )
         tree_context_menu.tk_popup(event.x_root, event.y_root)
 
@@ -3643,6 +3909,41 @@ def run():
     file_menu.add_command(label="New Window", command=new_window, accelerator="Ctrl+Shift+N")
     file_menu.add_command(label="Open File", command=open_file, accelerator="Ctrl+O")
     file_menu.add_command(label="Open Folder", command=open_folder)
+
+    recent_files_menu = tk.Menu(root, tearoff=0, **menu_opts)
+
+    def _open_recent(path):
+        if not os.path.isfile(path):
+            messagebox.showerror("Open Recent", f"{path}\n\nThis file no longer exists.")
+            paths = recent_files_state["paths"]
+            if path in paths:
+                paths.remove(path)
+                save_recent_files(paths)
+                _rebuild_recent_files_menu()
+            return
+        _open_path_in_tab(path)
+
+    def _clear_recent_files():
+        recent_files_state["paths"] = []
+        save_recent_files([])
+        _rebuild_recent_files_menu()
+
+    def _rebuild_recent_files_menu():
+        recent_files_menu.delete(0, tk.END)
+        paths = recent_files_state["paths"]
+        if not paths:
+            recent_files_menu.add_command(label="(No Recent Files)", state="disabled")
+            return
+        for recent_path in paths:
+            recent_files_menu.add_command(
+                label=recent_path, command=lambda p=recent_path: _open_recent(p)
+            )
+        recent_files_menu.add_separator()
+        recent_files_menu.add_command(label="Clear Recent Files", command=_clear_recent_files)
+
+    _rebuild_recent_files_menu()
+    file_menu.add_cascade(label="Open Recent", menu=recent_files_menu)
+
     file_menu.add_command(label="Save", command=save_file, accelerator="Ctrl+S")
     file_menu.add_command(label="Save As", command=save_as_file)
     file_menu.add_separator()
@@ -3673,6 +3974,7 @@ def run():
                 continue
             if not prompt_save_if_dirty(editor, tab_id):
                 return
+        stop_focus_session()
         save_current_session()
         stop_shell()
         root.destroy()
@@ -3715,6 +4017,165 @@ def run():
             return
         _switch_theme_and_relaunch(name)
 
+    # ---------- Zen / distraction-free mode ----------
+    # Hides everything but the editor surface itself: menu bar, explorer,
+    # output/terminal panel, minimap, and status bar. Nothing here is
+    # destroyed, just unpacked/forgotten from its parent, so re-entering
+    # normal mode is a straight replay of the original pack()/add() calls
+    # captured at startup - no state to reconstruct.
+    zen_state = {"active": False}
+
+    def _enter_zen_mode():
+        zen_state["active"] = True
+        zen_state["minimap_was_visible"] = minimap_state["visible"]
+
+        menu_bar_frame.pack_forget()
+        status_bar_divider.pack_forget()
+        status_bar.pack_forget()
+
+        # PanedWindow panes have to be forgotten (not just their contents
+        # hidden) or their sash/width reservation keeps eating screen space
+        # even at zero content.
+        try:
+            main_frame.forget(explorer_frame)
+        except tk.TclError:
+            pass
+        try:
+            main_frame.forget(output_frame)
+        except tk.TclError:
+            pass
+
+        if minimap_state["visible"]:
+            toggle_minimap()
+
+    def _exit_zen_mode():
+        zen_state["active"] = False
+
+        # Re-pack in the exact same order as startup (menu bar, then status
+        # bar/divider, then main_frame last) so the packer's carve-out order
+        # comes out identical to a fresh launch. main_frame is forgotten and
+        # immediately re-packed right here (rather than back in
+        # _enter_zen_mode) so it's never actually missing from the screen -
+        # it stays visible the whole time zen mode is active. Packing it
+        # last here means it claims whatever's left over (the middle), the
+        # same as it did at startup, rather than keeping a stale earlier
+        # position in the packing list that leaves the others nothing to
+        # carve from.
+        main_frame.pack_forget()
+        menu_bar_frame.pack(side="top", fill="x")
+        status_bar.pack(side="bottom", fill="x")
+        status_bar_divider.pack(side="bottom", fill="x")
+        main_frame.pack(fill="both", expand=True)
+
+        try:
+            main_frame.add(explorer_frame, width=220, minsize=120, stretch="never", before=center_frame)
+        except tk.TclError:
+            pass
+        try:
+            main_frame.add(output_frame, width=300, minsize=150, stretch="never")
+        except tk.TclError:
+            pass
+
+        if zen_state.get("minimap_was_visible") and not minimap_state["visible"]:
+            toggle_minimap()
+
+    # ---------- Focus session (Zen + Pomodoro + auto-pause music) ----------
+    # Work period: Zen Mode on, music (if any) keeps playing. Break period:
+    # Zen Mode drops so panels are usable again, and music auto-pauses so
+    # it doesn't keep playing while you're away - then both flip back when
+    # the next work period starts. Runs on a plain root.after loop rather
+    # than a thread since it only ever touches Tk widgets.
+    focus_state = {"active": False, "after_id": None}
+
+    def _focus_update_label():
+        mins, secs = divmod(max(focus_state["remaining"], 0), 60)
+        icon = "\U0001F345" if focus_state["phase"] == "work" else "\u2615"
+        phase_label = "Focus" if focus_state["phase"] == "work" else "Break"
+        status_focus_label.config(text=f"{icon} {phase_label} {mins:02d}:{secs:02d}")
+
+    def _focus_switch_phase():
+        root.bell()
+        if focus_state["phase"] == "work":
+            focus_state["phase"] = "break"
+            focus_state["remaining"] = focus_state["break_seconds"]
+            is_playing = music_controls.get("is_playing")
+            pause = music_controls.get("pause")
+            focus_state["music_was_playing"] = bool(is_playing and is_playing())
+            if focus_state["music_was_playing"] and pause:
+                pause()
+            if zen_state["active"]:
+                _exit_zen_mode()
+        else:
+            focus_state["phase"] = "work"
+            focus_state["remaining"] = focus_state["work_seconds"]
+            if focus_state.get("music_was_playing"):
+                resume = music_controls.get("resume")
+                if resume:
+                    resume()
+            if not zen_state["active"]:
+                _enter_zen_mode()
+        view_menu.entryconfig(
+            zen_menu_index,
+            label="Exit Zen Mode" if zen_state["active"] else "Enter Zen Mode"
+        )
+
+    def _focus_tick():
+        if not focus_state["active"]:
+            return
+        if focus_state["remaining"] <= 0:
+            _focus_switch_phase()
+        _focus_update_label()
+        focus_state["remaining"] -= 1
+        focus_state["after_id"] = root.after(1000, _focus_tick)
+
+    def start_focus_session():
+        if focus_state["active"]:
+            return
+        work_minutes = simpledialog.askinteger(
+            "Focus Session", "Work minutes:", initialvalue=25, minvalue=1, maxvalue=180, parent=root
+        )
+        if work_minutes is None:
+            return
+        break_minutes = simpledialog.askinteger(
+            "Focus Session", "Break minutes:", initialvalue=5, minvalue=1, maxvalue=60, parent=root
+        )
+        if break_minutes is None:
+            return
+
+        focus_state["active"] = True
+        focus_state["phase"] = "work"
+        focus_state["work_seconds"] = work_minutes * 60
+        focus_state["break_seconds"] = break_minutes * 60
+        focus_state["remaining"] = focus_state["work_seconds"]
+        focus_state["was_zen_before"] = zen_state["active"]
+        if not zen_state["active"]:
+            _enter_zen_mode()
+            view_menu.entryconfig(zen_menu_index, label="Exit Zen Mode")
+        view_menu.entryconfig(focus_menu_index, label="Stop Focus Session")
+        _focus_tick()
+
+    def stop_focus_session():
+        if not focus_state["active"]:
+            return
+        focus_state["active"] = False
+        if focus_state.get("after_id") is not None:
+            try:
+                root.after_cancel(focus_state["after_id"])
+            except Exception:
+                pass
+            focus_state["after_id"] = None
+        status_focus_label.config(text="")
+        if zen_state["active"] and not focus_state.get("was_zen_before"):
+            _exit_zen_mode()
+            view_menu.entryconfig(zen_menu_index, label="Enter Zen Mode")
+        view_menu.entryconfig(focus_menu_index, label="Start Focus Session")
+
+    def toggle_focus_session():
+        if focus_state["active"]:
+            stop_focus_session()
+        else:
+            start_focus_session()
+
     file_menu.add_command(label="Exit", command=on_exit)
 
     root.protocol("WM_DELETE_WINDOW", on_exit)
@@ -3725,6 +4186,9 @@ def run():
 
     run_menu = tk.Menu(root, tearoff=0, **menu_opts)
     run_menu.add_command(label="Run", command=run_code, accelerator="F5")
+    run_menu.add_command(label="Kill", command=kill_running)
+    run_menu.add_separator()
+    run_menu.add_command(label="Clear Terminal", command=clear_terminal, accelerator="Ctrl+K")
 
     view_menu = tk.Menu(root, tearoff=0, **menu_opts)
     view_menu.add_command(label="Terminal", command=focus_terminal, accelerator="Ctrl+`")
@@ -3752,6 +4216,34 @@ def run():
 
     view_menu.add_command(label="Hide Minimap", command=toggle_minimap, accelerator="Ctrl+M")
     minimap_menu_index = view_menu.index(tk.END)
+
+    def toggle_crt_scanlines():
+        crt_state["scanlines"] = not crt_state["scanlines"]
+        for ed in tab_editors.values():
+            apply_crt_scanlines(ed)
+        view_menu.entryconfig(
+            crt_menu_index,
+            label="Hide CRT Scanlines" if crt_state["scanlines"] else "Show CRT Scanlines"
+        )
+
+    view_menu.add_command(label="Show CRT Scanlines", command=toggle_crt_scanlines)
+    crt_menu_index = view_menu.index(tk.END)
+
+    def toggle_zen_mode():
+        if zen_state["active"]:
+            _exit_zen_mode()
+        else:
+            _enter_zen_mode()
+        view_menu.entryconfig(
+            zen_menu_index,
+            label="Exit Zen Mode" if zen_state["active"] else "Enter Zen Mode"
+        )
+
+    view_menu.add_command(label="Enter Zen Mode", command=toggle_zen_mode, accelerator="Ctrl+Shift+Z")
+    zen_menu_index = view_menu.index(tk.END)
+
+    view_menu.add_command(label="Start Focus Session", command=toggle_focus_session, accelerator="Ctrl+Shift+F")
+    focus_menu_index = view_menu.index(tk.END)
 
     view_menu.add_separator()
 
@@ -3787,6 +4279,7 @@ def run():
     root.bind("<Control-s>", lambda e: save_file())
     root.bind("<Control-w>", lambda e: close_tab())
     root.bind("<F5>", lambda e: run_code())
+    root.bind("<Control-k>", lambda e: clear_terminal())
     root.bind("<Control-f>", lambda e: open_find_replace("find"))
     root.bind("<Control-h>", lambda e: open_find_replace("replace"))
     root.bind("<Control-grave>", lambda e: focus_terminal())
@@ -3800,6 +4293,38 @@ def run():
     root.bind("<Control-0>", lambda e: zoom_reset())
     root.bind("<Control-KP_0>", lambda e: zoom_reset())
     root.bind("<Control-m>", lambda e: toggle_minimap())
+    root.bind("<Control-Shift-Z>", lambda e: toggle_zen_mode())
+    root.bind("<Control-Shift-z>", lambda e: toggle_zen_mode())
+    root.bind("<Control-Shift-F>", lambda e: toggle_focus_session())
+    root.bind("<Control-Shift-f>", lambda e: toggle_focus_session())
+
+    # ---------- Media keys ----------
+    # Lets you control the Music tab without switching to it. Real hardware
+    # media keys (XF86Audio*) work in Tk on Linux and some Windows builds,
+    # but support is inconsistent - Ctrl+Alt+Space/Left/Right are bound as
+    # reliable fallbacks that work everywhere regardless of keyboard/OS
+    # support for the physical media keys.
+    def _media_play_pause(event=None):
+        toggle = music_controls.get("toggle_play_pause")
+        if toggle:
+            toggle()
+
+    def _media_next(event=None):
+        nxt = music_controls.get("play_next")
+        if nxt:
+            nxt()
+
+    def _media_prev(event=None):
+        prev = music_controls.get("play_prev")
+        if prev:
+            prev()
+
+    for keysym in ("<XF86AudioPlay>", "<XF86AudioPause>", "<Control-Alt-space>"):
+        root.bind(keysym, _media_play_pause)
+    for keysym in ("<XF86AudioNext>", "<Control-Alt-Right>"):
+        root.bind(keysym, _media_next)
+    for keysym in ("<XF86AudioPrev>", "<Control-Alt-Left>"):
+        root.bind(keysym, _media_prev)
 
     # ---------- Restore previous session ----------
     # Bring back whatever folder/files were open last time (including right

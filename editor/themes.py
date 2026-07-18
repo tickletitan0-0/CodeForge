@@ -391,6 +391,57 @@ GITHUB_LIGHT_THEME = {
 }
 
 
+# ---------------- CRT / Retro Terminal ----------------
+# Phosphor-green-on-black, styled after old amber/green CRT monitors. The
+# editor's own "current line" and "scanline" tags do the rest of the retro
+# look (see highlight_syntax/apply_crt_scanlines in app.py) - this palette
+# just gives them the right base colors to work with.
+CRT_THEME = {
+    "app_bg":           "#0a0f0a",
+    "sidebar_bg":       "#081008",
+    "panel_header_bg":  "#0d160d",
+    "panel_header_fg":  "#33ff33",
+    "border":           "#1a331a",
+    "tree_active_bg":   "#123312",
+    "tree_active_fg":   "#66ff66",
+
+    "editor_bg":        "#0a0f0a",
+    "editor_fg":        "#33ff33",
+    "editor_insert":    "#66ff66",
+    "editor_select_bg": "#1f4d1f",
+    "editor_select_fg": "#ccffcc",
+    "line_number_bg":   "#0a0f0a",
+    "line_number_fg":   "#1f6b1f",
+    "indent_guide":     "#173317",
+
+    "current_line_bg":  "#102010",
+    "bracket_match_bg":  "#1f4d1f",
+    "search_match_bg":   "#3a4d1e",
+    "search_current_bg": "#4d7a1e",
+
+    "accent":            "#66ff66",
+
+    "output_bg":         "#0a0f0a",
+    "output_fg":         "#33ff33",
+
+    "popup_bg":          "#0d160d",
+    "popup_fg":          "#33ff33",
+    "popup_border":      "#1a331a",
+    "popup_select_bg":   "#1f4d1f",
+    "popup_select_fg":   "#ccffcc",
+
+    "muted_fg":          "#1f6b1f",
+
+    # Muted so keywords/strings/etc still stand out a little from plain
+    # text without breaking the monochrome phosphor feel.
+    "syntax_keyword":    "#7fff7f",
+    "syntax_string":     "#4dcc4d",
+    "syntax_comment":    "#1f6b1f",
+    "syntax_number":     "#a3ff9e",
+    "syntax_function":   "#99ff66",
+}
+
+
 THEMES = {
     "light": LIGHT_THEME,
     "dark": DARK_THEME,
@@ -400,6 +451,7 @@ THEMES = {
     "nord": NORD_THEME,
     "solarized_dark": SOLARIZED_DARK_THEME,
     "github_light": GITHUB_LIGHT_THEME,
+    "crt": CRT_THEME,
 }
 
 # Display names for the theme picker menu / status bar - only needed where
@@ -415,6 +467,7 @@ THEME_LABELS = {
     "nord": "Nord",
     "solarized_dark": "Solarized Dark",
     "github_light": "GitHub Light",
+    "crt": "CRT / Retro Terminal",
 }
 
 DEFAULT_THEME_NAME = "light"
@@ -494,6 +547,27 @@ def save_session(folder, open_files, active_path):
     _save_settings(data)
 
 
+MAX_RECENT_FILES = 10
+
+
+def load_recent_files():
+    """Return the recently-opened file paths, most-recent first. Missing/
+    corrupt data just comes back as an empty list."""
+    files = _load_settings().get("recent_files")
+    if not isinstance(files, list):
+        return []
+    return [f for f in files if isinstance(f, str)][:MAX_RECENT_FILES]
+
+
+def save_recent_files(paths):
+    """Persist the recent-files list. Callers are expected to have already
+    de-duped and capped it to MAX_RECENT_FILES - this just writes whatever
+    it's given."""
+    data = _load_settings()
+    data["recent_files"] = list(paths)[:MAX_RECENT_FILES]
+    _save_settings(data)
+
+
 def get_theme(name):
     """Return the palette dict for a theme name, falling back to light."""
     return THEMES.get(name, LIGHT_THEME)
@@ -531,4 +605,19 @@ def save_font_size_preference(size):
     size = max(MIN_FONT_SIZE, min(MAX_FONT_SIZE, size))
     data = _load_settings()
     data["font_size"] = size
+    _save_settings(data)
+
+
+def load_last_music_url():
+    """Return the last URL entered in the Music tab, or "" if none/corrupt -
+    lets the tab pre-fill (and auto-load) whatever playlist was playing last
+    time, instead of starting blank every launch."""
+    url = _load_settings().get("last_music_url")
+    return url if isinstance(url, str) else ""
+
+
+def save_last_music_url(url):
+    """Persist the Music tab's URL so it can be restored next launch."""
+    data = _load_settings()
+    data["last_music_url"] = url
     _save_settings(data)
