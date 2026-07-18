@@ -5,6 +5,7 @@ from tkinter import messagebox
 from tkinter import simpledialog
 import tkinter.font as tkfont
 import re
+import random
 import ast
 import builtins
 import importlib
@@ -16,7 +17,6 @@ import os
 import shutil
 import sys
 import threading
-import uuid
 import shlex
 
 try:
@@ -45,16 +45,6 @@ except ImportError:
     )
 
 try:
-    import winpty  # pip install pywinpty - provides a real Windows pseudo-console
-except ImportError:
-    winpty = None
-
-try:
-    import pty  # stdlib, POSIX only
-except ImportError:
-    pty = None
-
-try:
     # Optional dependency (pip install tkinterdnd2) that lets the OS file
     # manager drag files/folders straight onto the app. Root has to be a
     # tkinterdnd2.TkinterDnD.Tk() (not a plain tk.Tk()) for drop targets to
@@ -72,6 +62,14 @@ except ImportError:
     # Standalone script - plain import, same fallback pattern as themes
     # above.
     import music_player
+
+try:
+    # git_panel.py is being imported as part of the "editor" package.
+    from . import git_panel
+except ImportError:
+    # Standalone script - plain import, same fallback pattern as themes
+    # above.
+    import git_panel
 
 
 # ---------------- Theme ----------------
@@ -585,6 +583,79 @@ def run():
         darkcolor=[("selected", THEME["editor_bg"])]
     )
 
+    # Editor tabs get their own style (rather than restyling "TNotebook.Tab"
+    # globally) so the little close "x" only shows up on file tabs - the
+    # Output/Terminal/Music tabs on bottom_panel keep the plain look, since
+    # those aren't closable.
+    #
+    # tk.PhotoImage has no real alpha blending, but a freshly created one is
+    # fully transparent until pixels are explicitly set - so drawing just the
+    # X's diagonals and leaving everything else untouched gives a clean
+    # icon that sits correctly on top of both selected and unselected tab
+    # colors, in every theme, without needing a background color at all.
+    def _make_close_icon(color, size=12):
+        img = tk.PhotoImage(width=size, height=size)
+        inset = 3
+        for i in range(inset, size - inset):
+            img.put(color, (i, i))
+            img.put(color, (i, i + 1))
+            img.put(color, (size - 1 - i, i))
+            img.put(color, (size - 1 - i, i + 1))
+        return img
+
+    # Referenced by the style's element images - kept alive on the style
+    # object itself since ttk holds the images by name only. Losing the
+    # last live Python reference to a PhotoImage lets Tk garbage-collect
+    # its pixel data even though the name is still registered.
+    style._close_tab_icons = (
+        _make_close_icon(THEME["muted_fg"]),
+        _make_close_icon(THEME["panel_header_fg"]),
+        _make_close_icon(THEME["panel_header_fg"]),
+    )
+    icon_normal, icon_active, icon_pressed = style._close_tab_icons
+
+    style.element_create(
+        "EditorTab.close", "image", icon_normal,
+        ("pressed", icon_pressed), ("active", icon_active),
+        border=6, sticky=""
+    )
+    style.layout(
+        "EditorTabs.TNotebook.Tab",
+        [("TNotebook.tab", {"sticky": "nswe", "children": [
+            ("TNotebook.padding", {"side": "top", "sticky": "nswe", "children": [
+                ("TNotebook.focus", {"side": "top", "sticky": "nswe", "children": [
+                    ("TNotebook.label", {"side": "left", "sticky": ""}),
+                    ("EditorTab.close", {"side": "right", "sticky": ""}),
+                ]}),
+            ]}),
+        ]})]
+    )
+    style.configure(
+        "EditorTabs.TNotebook",
+        background=THEME["app_bg"],
+        borderwidth=0,
+        bordercolor=THEME["border"],
+        lightcolor=THEME["app_bg"],
+        darkcolor=THEME["app_bg"]
+    )
+    style.configure(
+        "EditorTabs.TNotebook.Tab",
+        background=THEME["panel_header_bg"],
+        foreground=THEME["panel_header_fg"],
+        padding=(10, 4, 6, 4),
+        borderwidth=0,
+        bordercolor=THEME["border"],
+        lightcolor=THEME["panel_header_bg"],
+        darkcolor=THEME["panel_header_bg"]
+    )
+    style.map(
+        "EditorTabs.TNotebook.Tab",
+        background=[("selected", THEME["editor_bg"])],
+        foreground=[("selected", THEME["editor_fg"])],
+        lightcolor=[("selected", THEME["editor_bg"])],
+        darkcolor=[("selected", THEME["editor_bg"])]
+    )
+
     for orientation in ("Vertical", "Horizontal"):
         style.configure(
             f"{orientation}.TScrollbar",
@@ -681,6 +752,21 @@ def run():
         cursor="hand2"
     )
     status_music_label.pack(side="left")
+
+    # Mirrors the current branch from the Source Control tab, the same
+    # way status_music_label mirrors the Music tab - text/click-to-focus
+    # binding wired up once the Source Control tab itself exists further
+    # down in run().
+    status_git_label = tk.Label(
+        status_bar,
+        text="",
+        bg=THEME["panel_header_bg"],
+        fg=THEME["panel_header_fg"],
+        anchor="w",
+        padx=10,
+        cursor="hand2"
+    )
+    status_git_label.pack(side="left")
 
     status_focus_label = tk.Label(
         status_bar,
@@ -788,13 +874,19 @@ def run():
         background=THEME["tree_active_bg"],
         foreground=THEME["tree_active_fg"]
     )
+    # Explorer row colors mirroring `git status` - staged/modified/
+    # untracked - refreshed by apply_git_status_tags() below whenever the
+    # tree or the Source Control tab reports new status.
+    project_tree.tag_configure("git_staged", foreground=THEME["accent"])
+    project_tree.tag_configure("git_modified", foreground=THEME["search_current_bg"])
+    project_tree.tag_configure("git_untracked", foreground=THEME["syntax_comment"])
 
     main_frame.add(explorer_frame, width=220, minsize=120, stretch="never")
 
     center_frame = tk.Frame(main_frame, bg=THEME["app_bg"], highlightthickness=0, bd=0)
     main_frame.add(center_frame, minsize=300, stretch="always")
 
-    tab_control = ttk.Notebook(center_frame)
+    tab_control = ttk.Notebook(center_frame, style="EditorTabs.TNotebook")
     tab_control.pack(fill="both", expand=True)
 
     project_path = None
@@ -840,7 +932,7 @@ def run():
 
     # Toolbar row above the Output/Terminal tabs - quick access to the
     # three actions you'd otherwise have to dig into the Run menu for.
-    # Defined here (before run_code/kill_running/clear_terminal exist)
+    # Defined here (before run_code/kill_running/clear_output exist)
     # is fine: the button `command` lambdas only look those names up when
     # actually clicked, by which point run() has finished defining them.
     terminal_toolbar_opts = {
@@ -871,7 +963,7 @@ def run():
     kill_button.pack(side="left")
 
     clear_button = tk.Button(
-        terminal_toolbar, text="\u2716 Clear", command=lambda: clear_terminal(),
+        terminal_toolbar, text="\u2716 Clear", command=lambda: clear_output(),
         **terminal_toolbar_opts
     )
     clear_button.pack(side="left")
@@ -909,42 +1001,46 @@ def run():
     )
     output_scrollbar.pack(side="right", fill="y")
     output_area.config(yscrollcommand=output_scrollbar.set)
+    output_area.tag_configure("taunt", foreground="orange")
 
-    # ---- Terminal tab (interactive shell-like console) ----
+    # ---- Terminal tab (spawns your real system terminal) ----
+    # No embedded shell/pseudo-console here on purpose - trying to emulate
+    # a terminal (cursor tracking, line wrapping, escape codes, PSReadLine
+    # redraws...) inside a Tk Text widget is a deep rabbit hole and never
+    # quite matches the real thing. Instead this just launches your OS's
+    # actual terminal app (Windows Terminal/PowerShell, macOS Terminal,
+    # or whatever's on Linux) as its own separate window, the same way
+    # Code::Blocks/Dev-C++ hand off to a real console for "Run" below.
     terminal_tab = tk.Frame(bottom_panel, bg=THEME["output_bg"])
     bottom_panel.add(terminal_tab, text="Terminal")
 
-    terminal_area = tk.Text(
+    tk.Label(
         terminal_tab,
-        font=("Consolas", 10),
-        bg=THEME["output_bg"],
-        fg=THEME["output_fg"],
-        insertbackground=THEME["editor_insert"],
-        selectbackground=THEME["editor_select_bg"],
-        selectforeground=THEME["editor_select_fg"],
-        highlightthickness=0,
-        border=0,
-        wrap="word",
-        undo=False
-    )
-    terminal_area.pack(side="left", fill="both", expand=True)
+        text=(
+            "\U0001F5A5  Opens your system's own terminal app in the "
+            "current project folder - a separate window, not an emulated "
+            "one inside CodeForge."
+        ),
+        bg=THEME["output_bg"], fg=THEME["muted_fg"], justify="left",
+        wraplength=260, padx=16, pady=16, anchor="w",
+    ).pack(anchor="w", fill="x")
 
-    terminal_scrollbar = ttk.Scrollbar(
-        terminal_tab,
-        orient="vertical",
-        command=terminal_area.yview,
-        style="Vertical.TScrollbar"
+    _term_tab_btn_opts = {
+        "bg": THEME["panel_header_bg"], "fg": THEME["panel_header_fg"],
+        "activebackground": THEME["editor_select_bg"], "activeforeground": THEME["editor_select_fg"],
+        "relief": "flat", "bd": 0, "highlightthickness": 0, "padx": 10, "pady": 4, "cursor": "hand2",
+    }
+    open_terminal_btn = tk.Button(
+        terminal_tab, text="\u25B6 Open Terminal", command=lambda: open_external_terminal(),
+        **_term_tab_btn_opts
     )
-    terminal_scrollbar.pack(side="right", fill="y")
-    terminal_area.config(yscrollcommand=terminal_scrollbar.set)
-    terminal_area.tag_configure("term_error", foreground=THEME["syntax_string"])
-    terminal_area.tag_configure("term_muted", foreground=THEME["muted_fg"])
+    open_terminal_btn.pack(anchor="w", padx=16, pady=(0, 16))
 
     # ---- Music tab (background YouTube playlist player) ----
     # Fully optional - degrades to an install hint if yt-dlp/python-vlc
-    # aren't present, same graceful-fallback pattern as winpty/pty/
-    # tkinterdnd2 above. Placed after Terminal so the notebook reads
-    # Output / Terminal / Music left to right.
+    # aren't present, same graceful-fallback pattern as tkinterdnd2 above.
+    # Placed after Terminal so the notebook reads Output / Terminal /
+    # Music left to right.
     music_tab = tk.Frame(bottom_panel, bg=THEME["output_bg"])
     bottom_panel.add(music_tab, text="\u266A Music")
 
@@ -964,599 +1060,188 @@ def run():
 
     status_music_label.bind("<Button-1>", _focus_music_tab)
 
+    # ---- Source Control tab (git status/stage/commit/push/pull) ----
+    # Fully optional - degrades to an install hint if a `git` executable
+    # isn't on PATH, same graceful-fallback pattern as Music above.
+    git_tab = tk.Frame(bottom_panel, bg=THEME["output_bg"])
+    bottom_panel.add(git_tab, text="\u2325 Git")
+
+    def _update_git_status_label(branch, ahead, behind):
+        if branch:
+            text = f"\u2325 {branch}"
+            if ahead:
+                text += f" \u2191{ahead}"
+            if behind:
+                text += f" \u2193{behind}"
+            status_git_label.config(text=text)
+        else:
+            status_git_label.config(text="")
+
+    git_controls = git_panel.build_git_panel(
+        git_tab, THEME,
+        get_project_path=lambda: project_path,
+        on_status_change=_update_git_status_label,
+        on_open_file=lambda p: _open_path_in_tab(p),
+    )
+
+    def _focus_git_tab(event=None):
+        bottom_panel.select(git_tab)
+
+    status_git_label.bind("<Button-1>", _focus_git_tab)
+
+    def refresh_git_state():
+        """Called after anything that can change git status - a save, a
+        folder open, an external refresh - so the Source Control tab and
+        the explorer's status colors both stay current. Cheap to call
+        liberally: both halves no-op quickly if nothing's actually
+        changed."""
+        git_controls["refresh"]()
+        apply_git_status_tags()
+
     main_frame.add(output_frame, width=300, minsize=150, stretch="never")
 
-    # ---------- Terminal engine ----------
-    # Backed by a real pseudo-console (ConPTY on Windows via pywinpty, or the
-    # stdlib pty module on macOS/Linux) rather than plain pipes. A plain pipe
-    # makes the shell think it isn't attached to a terminal at all, so it
-    # fully-buffers its output (you may never see a prompt) and does none of
-    # its own line editing. A pseudo-console fixes both: the shell behaves
-    # exactly as it would in a real terminal window, and handles its own
-    # backspace/arrow-key/history editing - we just forward raw keystrokes
-    # and mirror whatever the shell echoes back.
+    # ---------- External terminal + run process ----------
+    # Both the Terminal tab and "Run" hand off to a real, separate OS
+    # process/window instead of an embedded pseudo-console - no shell
+    # output is piped back into CodeForge and parsed/replayed here, so
+    # there's no cursor tracking, escape-code parsing, or line-wrap math
+    # to get out of sync with the real thing (which is what made the old
+    # embedded terminal glitchy, especially with PowerShell's own
+    # cursor-heavy redraws). It also means whatever you run keeps working
+    # normally for interactive input (input()/Console.ReadLine()/etc.),
+    # exactly like Code::Blocks or Dev-C++ popping open a console window.
     IS_WINDOWS = (os.name == "nt")
-    HAS_PTY_SUPPORT = bool(winpty) if IS_WINDOWS else bool(pty)
 
-    terminal_state = {
-        "proc": None,       # winpty.PtyProcess (Windows) or a dict of pty fds/pid (POSIX)
-        "alive": False,
-        "pending": "",      # a trailing, not-yet-complete escape sequence held over
-    }                       # between reads so it isn't split across two chunks
+    # Tracks the most recent external process spawned by Run, so "Kill"
+    # has something to terminate. Not used for Terminal - that window is
+    # fully independent of CodeForge once opened.
+    run_state = {"proc": None}
 
-    # "Run" sends the actual command straight into the live terminal (same
-    # shell the user can type into) instead of a separate one-shot
-    # subprocess, so the program can read stdin from the user just like it
-    # would in a real terminal. To *also* mirror its printable output into
-    # the Output panel, we watch the raw text flowing through for a unique
-    # start/end marker pair that bracket the run, and buffer whatever shows
-    # up in between.
-    run_state = {
-        "awaiting_start": False,
-        "active": False,
-        "start_marker": None,   # compiled regex - matches only once actually executed
-        "end_marker": None,
-        "buffer": "",           # raw text collected between the markers
-        "scan_pending": "",     # partial marker text held over between reads
-    }
+    def _project_cwd():
+        return project_path if project_path and os.path.isdir(project_path) else os.getcwd()
 
-    # ---- Mini VT100/ANSI terminal emulator ----
-    # A real terminal doesn't just print raw bytes: escape codes move a
-    # cursor around and erase pieces of the screen, and typed characters
-    # OVERWRITE whatever is under the cursor rather than always being
-    # appended at the end. PowerShell's line editor (PSReadLine) leans on
-    # exactly this - it redraws in place using cursor-left/right and
-    # erase-to-end-of-line codes (e.g. for backspace, arrow-key history,
-    # and its inline suggestion text). Previously we only stripped the
-    # escape codes and always appended at "end", which ignored those
-    # cursor moves entirely - producing duplicated characters and dead
-    # backspace/arrow keys. Instead we track a real cursor position (a Tk
-    # mark) and apply each instruction the way a terminal would.
-    # Params: 0x30-0x3F ("0-9:;<=>?"), intermediates: 0x20-0x2F (" " through
-    # "/"), final byte: 0x40-0x7E ("@" through "~"). The earlier version only
-    # allowed "[0-9;?]" with no intermediate bytes at all, so any sequence
-    # outside that narrow set (e.g. cursor-shape codes like "\x1b[3 q", or
-    # "<"/"="/">" prefixed sequences) could never match. That made it look
-    # "incomplete" forever, so everything after it piled up unresolved in
-    # the pending buffer instead of ever being displayed.
-    _CSI_RE = re.compile(r'\x1b\[([0-9:;<=>?]*)[ -/]*([@-~])')
-    _OSC_END_RE = re.compile(r'(\x07|\x1b\\)')
-
-    def _term_cursor_idx():
-        return terminal_area.index("term_cursor")
-
-    def _term_last_line():
-        return int(terminal_area.index("end-1c").split(".")[0])
-
-    def _term_putc(ch):
-        idx = _term_cursor_idx()
-        line_end = terminal_area.index(f"{idx.split('.')[0]}.end")
-        if terminal_area.compare(idx, "<", line_end):
-            terminal_area.delete(idx, f"{idx}+1c")  # overwrite, don't insert
-        terminal_area.insert(idx, ch)
-        terminal_area.mark_set("term_cursor", f"{idx}+1c")
-
-    def _term_trim_trailing_pad():
-        # A destructive backspace (BS, " ", BS) moves the cursor left,
-        # overwrites the erased character with a literal space, then moves
-        # left again - correct on a real terminal's fixed-width grid, but
-        # here lines are just strings, so that overwrite leaves a REAL
-        # trailing space sitting after the cursor instead of actually
-        # shrinking the line. Left in place, that stray space fools later
-        # "are we at the true end of the buffer?" checks into thinking a
-        # line already exists below us, so no new line ever gets inserted
-        # and subsequent output keeps landing on this same row.
-        #
-        # Called after every cursor-moving step (not just before a "\n"),
-        # because a "\r" (or any other jump) can reach the padding before
-        # a "\n" does - trimming only inside the linefeed handler caught
-        # some cases but not that one, which is why it only "sometimes"
-        # showed a stray character.
-        idx = _term_cursor_idx()
-        line = int(idx.split(".")[0])
-        if line != _term_last_line():
-            return
-        line_end_idx = terminal_area.index(f"{line}.end")
-        if terminal_area.compare(idx, ">=", line_end_idx):
-            return
-        tail = terminal_area.get(idx, line_end_idx)
-        if tail and tail.strip(" ") == "":
-            terminal_area.delete(idx, line_end_idx)
-
-    def _term_cr():
-        line = _term_cursor_idx().split(".")[0]
-        terminal_area.mark_set("term_cursor", f"{line}.0")
-
-    def _term_lf():
-        idx = _term_cursor_idx()
-        line, col = idx.split(".")
-        line, col = int(line), int(col)
-
-        # Only insert a brand-new "\n" character if the cursor is sitting at
-        # the very end of everything typed so far - if a line below already
-        # exists (e.g. we scrolled up through history) just move onto it
-        # instead of inserting another one, which was creating a fresh
-        # blank line on every single line of output.
-        if terminal_area.compare(idx, ">=", "end-1c"):
-            terminal_area.insert("end-1c", "\n")
-        new_col = min(col, int(terminal_area.index(f"{line + 1}.end").split(".")[1]))
-        terminal_area.mark_set("term_cursor", f"{line + 1}.{new_col}")
-
-    def _term_left(n=1):
-        terminal_area.mark_set("term_cursor", f"term_cursor-{max(n, 1)}c")
-
-    def _term_right(n=1):
-        terminal_area.mark_set("term_cursor", f"term_cursor+{max(n, 1)}c")
-
-    def _term_up(n=1):
-        line, col = _term_cursor_idx().split(".")
-        terminal_area.mark_set("term_cursor", f"{max(1, int(line) - n)}.{col}")
-
-    def _term_down(n=1):
-        line, col = _term_cursor_idx().split(".")
-        terminal_area.mark_set("term_cursor", f"{min(_term_last_line(), int(line) + n)}.{col}")
-
-    def _term_col(n=1):
-        line = _term_cursor_idx().split(".")[0]
-        terminal_area.mark_set("term_cursor", f"{line}.{max(0, n - 1)}")
-
-    def _term_erase_to_eol():
-        idx = _term_cursor_idx()
-        terminal_area.delete(idx, f"{idx.split('.')[0]}.end")
-
-    def _term_erase_to_bol():
-        idx = _term_cursor_idx()
-        terminal_area.delete(f"{idx.split('.')[0]}.0", idx)
-
-    def _term_erase_line():
-        line = _term_cursor_idx().split(".")[0]
-        terminal_area.delete(f"{line}.0", f"{line}.end")
-        terminal_area.mark_set("term_cursor", f"{line}.0")
-
-    def _term_clear_screen():
-        terminal_area.delete("1.0", "end")
-        terminal_area.mark_set("term_cursor", "1.0")
-
-    def _term_csi_action(params_str, final):
-        parts = [p for p in params_str.lstrip("?").split(";") if p != ""]
-
-        def num(i, default=1):
-            try:
-                return int(parts[i]) if i < len(parts) and parts[i] != "" else default
-            except ValueError:
-                return default
-
-        if final == "A":
-            return lambda: _term_up(num(0))
-        if final == "B":
-            return lambda: _term_down(num(0))
-        if final == "C":
-            return lambda: _term_right(num(0))
-        if final == "D":
-            return lambda: _term_left(num(0))
-        if final == "G":
-            return lambda: _term_col(num(0))
-        if final in ("H", "f"):
-            row, col = num(0), num(1)
-            return lambda: terminal_area.mark_set(
-                "term_cursor", f"{max(1, min(_term_last_line(), row))}.{max(0, col - 1)}"
-            )
-        if final == "K":
-            mode = num(0, 0)
-            return {0: _term_erase_to_eol, 1: _term_erase_to_bol}.get(mode, _term_erase_line)
-        if final == "J":
-            return _term_clear_screen
-        return lambda: None  # SGR colors, mode toggles, cursor save/restore, etc: no-op
-
-    def _consume_escape(text, i):
-        """Returns (chars_consumed, action) for the escape sequence starting
-        at i, or None if it's cut off at the end of this chunk (incomplete)."""
-        n = len(text)
-        if i + 1 >= n:
-            return None
-        nxt = text[i + 1]
-        if nxt == "[":
-            m = _CSI_RE.match(text, i)
-            if not m:
-                return None
-            return m.end() - i, _term_csi_action(m.group(1), m.group(2))
-        if nxt == "]":
-            m = _OSC_END_RE.search(text, i + 2)
-            if not m:
-                return None
-            return m.end() - i, (lambda: None)
-        return 2, (lambda: None)  # other 2-byte "Fe" escapes: no visual effect we track
-
-    def _term_feed(raw):
-        """Feed real shell output through the emulator (cursor-aware)."""
-        text = terminal_state["pending"] + raw
-        terminal_state["pending"] = ""
-        i, n = 0, len(text)
-        while i < n:
-            try:
-                ch = text[i]
-                if ch == "\x1b":
-                    result = _consume_escape(text, i)
-                    if result is None:
-                        # A sequence genuinely split across two reads is
-                        # only ever a handful of bytes. If far more than
-                        # that is sitting unmatched, it's not a split -
-                        # it's a sequence our parser doesn't recognize -
-                        # so drop just the ESC and keep going rather than
-                        # stalling forever.
-                        if n - i > 128:
-                            i += 1
-                            continue
-                        terminal_state["pending"] = text[i:]
-                        break
-                    consumed, action = result
-                    action()
-                    i += consumed
-                elif ch == "\r":
-                    _term_cr()
-                    i += 1
-                elif ch == "\n":
-                    _term_lf()
-                    i += 1
-                elif ch == "\x08":
-                    _term_left(1)
-                    i += 1
-                elif ch == "\x07":
-                    i += 1  # bell
+    def open_external_terminal():
+        """Launches the user's own terminal app in a new window, cwd'd to
+        the current project folder (or CodeForge's own cwd if no folder
+        is open)."""
+        cwd = _project_cwd()
+        try:
+            if IS_WINDOWS:
+                wt = shutil.which("wt") or shutil.which("wt.exe")
+                if wt:
+                    subprocess.Popen([wt, "-d", cwd])
                 else:
-                    _term_putc(ch)
-                    i += 1
-                _term_trim_trailing_pad()
-            except Exception:
-                # Something in the emulator broke on this one character -
-                # skip it rather than losing everything queued up after it.
-                i += 1
-        terminal_area.see("term_cursor")
-
-    _MIRROR_CSI_RE = re.compile(r'\x1b\[[0-9:;<=>?]*[ -/]*[@-~]')
-    _MIRROR_OSC_RE = re.compile(r'\x1b\][^\x07\x1b]*(\x07|\x1b\\)')
-
-    def _strip_ansi_for_mirror(text):
-        """Reduce real terminal output to plain text good enough for the
-        Output panel - not a full emulation, just enough to drop escape
-        codes and resolve simple backspace/carriage-return redraws so a
-        program's actual printed output doesn't show control bytes."""
-        text = _MIRROR_OSC_RE.sub("", text)
-        text = _MIRROR_CSI_RE.sub("", text)
-        text = re.sub(r'\x1b.', '', text)
-        text = text.replace("\x07", "")
-
-        out = []
-        i, n = 0, len(text)
-        while i < n:
-            ch = text[i]
-            if ch == "\x08":
-                if out and out[-1] != "\n":
-                    out.pop()
-                i += 1
-            elif ch == "\r":
-                # A "\r\n" pair is just a normal (CRLF) line ending, not an
-                # overwrite - skip the "\r" and let the "\n" append as
-                # usual instead of erasing the line we just wrote. Only a
-                # standalone "\r" (e.g. a progress bar redrawing in place)
-                # should trigger the destructive rewind.
-                if i + 1 < n and text[i + 1] == "\n":
-                    i += 1
-                    continue
-                while out and out[-1] != "\n":
-                    out.pop()
-                i += 1
+                    subprocess.Popen(
+                        ["powershell.exe", "-NoExit", "-Command",
+                         f"Set-Location -LiteralPath '{cwd}'"],
+                        cwd=cwd,
+                        creationflags=subprocess.CREATE_NEW_CONSOLE,
+                    )
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", "-a", "Terminal", cwd])
             else:
-                out.append(ch)
-                i += 1
-        return "".join(out)
-
-    def _finish_run_mirror():
-        text = _strip_ansi_for_mirror(run_state["buffer"])
-        run_state["buffer"] = ""
-        output_area.config(state="normal")
-        output_area.delete("1.0", tk.END)
-        output_area.insert("1.0", text if text.strip() else "(no output)")
-        output_area.config(state="disabled")
-
-    def _strip_one_leading_newline(text):
-        """Drop a single line-ending (CRLF or LF) off the front of text,
-        if present - used to swallow the blank line that would otherwise
-        be left behind where a marker line used to be."""
-        if text[:2] == "\r\n":
-            return text[2:]
-        if text[:1] in ("\r", "\n"):
-            return text[1:]
-        return text
-
-    def _unsafe_tail_len(text, literal_prefix):
-        """How many trailing characters of `text` could be the start of
-        `literal_prefix` (the fixed, non-digit part of a RUNSOF_/RUNEOF_
-        marker) and so must be held back until more data arrives to
-        confirm or rule it out. Returns 0 when the tail plainly isn't
-        headed toward the marker - which is true for virtually all real
-        program output and typed input, so that text can be shown right
-        away instead of waiting for a fixed-size chunk to build up."""
-        max_k = min(len(text), len(literal_prefix))
-        for k in range(max_k, 0, -1):
-            if text.endswith(literal_prefix[:k]):
-                return k
-        return 0
-
-    def _term_feed_with_mirror(raw):
-        """Wraps _term_feed: while a "Run" is in flight, watches the raw
-        shell output for its start/end markers and buffers whatever runs
-        between them, so it can be shown plain-text in the Output panel.
-        The synthetic command app.py types (with the RUNSOF/RUNEOF marker
-        names baked into it) and the marker echoes themselves are NEVER
-        fed to the real terminal - only the program's actual output
-        between them is, so the marker text never shows up on screen."""
-        if not (run_state["awaiting_start"] or run_state["active"]):
-            _term_feed(raw)
-            return
-
-        raw = run_state["scan_pending"] + raw
-        run_state["scan_pending"] = ""
-
-        if run_state["awaiting_start"]:
-            m = run_state["start_marker"].search(raw)
-            if not m:
-                # Hold back only text that could actually be the start of
-                # the marker; everything else is just the synthetic
-                # command's own local echo - discard it silently, run_code()
-                # already printed a clean, friendly line in its place.
-                unsafe = _unsafe_tail_len(raw, run_state["start_prefix"])
-                run_state["scan_pending"] = raw[-unsafe:] if unsafe else ""
-                return
-            run_state["awaiting_start"] = False
-            run_state["active"] = True
-            raw = _strip_one_leading_newline(raw[m.end():])
-            if not raw:
-                return
-
-        m = run_state["end_marker"].search(raw)
-        if not m:
-            unsafe = _unsafe_tail_len(raw, run_state["end_prefix"])
-            chunk = raw[:-unsafe] if unsafe else raw
-            run_state["buffer"] += chunk
-            run_state["scan_pending"] = raw[-unsafe:] if unsafe else ""
-            _term_feed(chunk)
-            return
-
-        run_state["buffer"] += raw[:m.start()]
-        _term_feed(raw[:m.start()])
-        run_state["active"] = False
-        _finish_run_mirror()
-        remainder = _strip_one_leading_newline(raw[m.end():])
-        if remainder:
-            _term_feed(remainder)
-
-    def _term_print(text, tag=None):
-        """Print an internal (non-shell) message - plain text, always appended."""
-        if not text:
-            return
-        if tag:
-            terminal_area.insert("end", text, tag)
-        else:
-            terminal_area.insert("end", text)
-        terminal_area.mark_set("term_cursor", "end")
-        terminal_area.see("end")
-
-    def _term_on_process_exit():
-        if terminal_state["alive"]:
-            terminal_state["alive"] = False
-            _term_print("\n[shell exited]\n", "term_muted")
-
-    def _term_reader_loop_windows(proc):
-        try:
-            while proc.isalive():
-                try:
-                    data = proc.read(4096)
-                except EOFError:
-                    break
-                if data:
-                    root.after(0, lambda t=data: _term_feed_with_mirror(t))
-        except Exception:
-            pass
-        root.after(0, _term_on_process_exit)
-
-    def _term_reader_loop_posix(master_fd):
-        try:
-            while True:
-                try:
-                    chunk = os.read(master_fd, 4096)
-                except OSError:
-                    break
-                if not chunk:
-                    break
-                text = chunk.decode("utf-8", errors="replace")
-                root.after(0, lambda t=text: _term_feed_with_mirror(t))
-        except Exception:
-            pass
-        root.after(0, _term_on_process_exit)
-
-    def start_shell():
-        if not HAS_PTY_SUPPORT:
-            if IS_WINDOWS:
-                _term_print(
-                    "Real terminal support needs the 'pywinpty' package, "
-                    "which isn't installed.\nInstall it with:\n\n"
-                    "    pip install pywinpty\n\n"
-                    "then reopen this Terminal tab.\n",
-                    "term_error"
+                for exe, args in (
+                    ("x-terminal-emulator", []),
+                    ("gnome-terminal", [f"--working-directory={cwd}"]),
+                    ("konsole", ["--workdir", cwd]),
+                    ("xfce4-terminal", [f"--working-directory={cwd}"]),
+                    ("xterm", []),
+                ):
+                    path = shutil.which(exe)
+                    if path:
+                        subprocess.Popen([path] + args, cwd=cwd)
+                        return
+                messagebox.showerror(
+                    "Open Terminal",
+                    "Couldn't find a terminal emulator on this system "
+                    "(tried gnome-terminal, konsole, xfce4-terminal, xterm).\n"
+                    "Install one and try again."
                 )
-            else:
-                _term_print(
-                    "Couldn't load the 'pty' module, so a real terminal "
-                    "isn't available on this system.\n",
-                    "term_error"
-                )
-            return
+        except Exception as e:
+            messagebox.showerror("Open Terminal", f"Couldn't open a terminal:\n{e}")
 
+    def _spawn_run_console(interpreter, filename, run_dir):
+        """Spawns a new console window that runs `interpreter filename`
+        (cwd=run_dir) and pauses at the end so the output stays on screen
+        - the same handoff Code::Blocks/Dev-C++ do for "Run". Returns the
+        Popen handle for the spawned process."""
         if IS_WINDOWS:
-            try:
-                proc = winpty.PtyProcess.spawn(
-                    # wsl.exe launched from a Windows cwd automatically maps
-                    # it to the matching /mnt/... path inside the distro.
-                    ["wsl.exe"],
-                    cwd=os.getcwd(),
-                    dimensions=(32, 120)
-                )
-            except Exception as e:
-                _term_print(
-                    f"Failed to start WSL: {e}\n"
-                    "Make sure WSL is installed and 'wsl.exe' is on your PATH "
-                    "(run 'wsl --install' from an elevated prompt if it isn't set up).\n",
-                    "term_error"
-                )
-                return
-            terminal_state["proc"] = proc
-            terminal_state["alive"] = True
-            threading.Thread(target=_term_reader_loop_windows, args=(proc,), daemon=True).start()
-        else:
-            shell_path = os.environ.get("SHELL", "/bin/bash")
-            master_fd, slave_fd = pty.openpty()
-            try:
-                proc = subprocess.Popen(
-                    [shell_path],
-                    cwd=os.getcwd(),
-                    stdin=slave_fd,
-                    stdout=slave_fd,
-                    stderr=slave_fd,
-                    preexec_fn=os.setsid,
-                    close_fds=True
-                )
-            except Exception as e:
-                os.close(master_fd)
-                os.close(slave_fd)
-                _term_print(f"Failed to start shell: {e}\n", "term_error")
-                return
-            os.close(slave_fd)
-            terminal_state["proc"] = {"popen": proc, "master_fd": master_fd}
-            terminal_state["alive"] = True
-            threading.Thread(target=_term_reader_loop_posix, args=(master_fd,), daemon=True).start()
+            # NOT a hand-built '{interpreter} "{filename}" & ...' string -
+            # cmd.exe's own quote handling doesn't treat backslash-quote
+            # as an escape the way subprocess's list2cmdline (which runs
+            # on any string passed as a single list element) assumes it
+            # will. The two disagree on what the quotes mean, and the
+            # result is cmd.exe misparsing the whole line - which is what
+            # spliced the current directory in front of the filename with
+            # a stray quote and doubled backslashes. Passing each token as
+            # its own list element instead lets subprocess quote only the
+            # filename (and only if it actually needs it), which both
+            # subprocess and cmd.exe agree on.
+            return subprocess.Popen(
+                ["cmd.exe", "/c", interpreter, filename, "&", "echo.", "&", "pause"],
+                cwd=run_dir,
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
+            )
+        if sys.platform == "darwin":
+            # macOS Terminal.app can be pointed at a script file directly
+            # (a ".command" file), which is simpler and more reliable than
+            # driving it via osascript.
+            script = (
+                f"cd {shlex.quote(run_dir)}\n"
+                f"{interpreter} {shlex.quote(filename)}\n"
+                "echo\nread -n 1 -s -r -p 'Press any key to close...'\n"
+            )
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".command", delete=False) as tmp:
+                tmp.write(script)
+                script_path = tmp.name
+            os.chmod(script_path, 0o755)
+            return subprocess.Popen(["open", script_path])
 
-    def init_terminal():
-        terminal_area.delete("1.0", "end")
-        terminal_area.mark_set("term_cursor", "1.0")
-        terminal_area.mark_gravity("term_cursor", "left")
-        start_shell()
-
-    def _term_send_raw(data):
-        proc = terminal_state.get("proc")
-        if not proc or not terminal_state["alive"]:
-            return
-        try:
-            if IS_WINDOWS:
-                proc.write(data)
-            else:
-                os.write(proc["master_fd"], data.encode("utf-8", errors="replace"))
-        except (OSError, ValueError):
-            pass
-
-    def stop_shell():
-        proc = terminal_state.get("proc")
-        if not proc or not terminal_state["alive"]:
-            return
-        terminal_state["alive"] = False
-        try:
-            if IS_WINDOWS:
-                proc.terminate(force=True)
-            else:
-                proc["popen"].terminate()
-                os.close(proc["master_fd"])
-        except Exception:
-            pass
+        inner = (
+            f"cd {shlex.quote(run_dir)} && {interpreter} {shlex.quote(filename)}; "
+            "echo; read -n 1 -s -r -p 'Press any key to close...'"
+        )
+        for exe, args in (
+            ("x-terminal-emulator", ["-e", "bash", "-c", inner]),
+            ("gnome-terminal", ["--", "bash", "-c", inner]),
+            ("konsole", ["-e", "bash", "-c", inner]),
+            ("xfce4-terminal", ["-e", f"bash -c {shlex.quote(inner)}"]),
+            ("xterm", ["-e", "bash", "-c", inner]),
+        ):
+            path = shutil.which(exe)
+            if path:
+                return subprocess.Popen([path] + args)
+        raise RuntimeError(
+            "No terminal emulator found to run the program in "
+            "(tried gnome-terminal, konsole, xfce4-terminal, xterm)."
+        )
 
     def kill_running():
-        """Send an interrupt (Ctrl+C) into the live shell - the same thing
-        pressing Ctrl+C in the Terminal tab does. Stops whatever's
-        currently running (a "Run", or anything typed directly into the
-        terminal) without tearing down the shell process itself. Harmless
-        no-op if the shell is just sitting idle at a prompt."""
-        if terminal_state["alive"]:
-            _term_send_raw("\x03")
+        """Force-closes the most recent Run's console window/process
+        tree. Harmless no-op if nothing's currently running."""
+        proc = run_state.get("proc")
+        if not proc or proc.poll() is not None:
+            return
+        try:
+            if IS_WINDOWS:
+                # proc is cmd.exe, with the real interpreter as a child -
+                # plain terminate() only kills cmd.exe and leaves the
+                # child running, so kill the whole tree instead.
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    capture_output=True
+                )
+            else:
+                proc.terminate()
+        except Exception:
+            pass
 
-    def clear_terminal():
-        """Wipe the visible Output and Terminal panels. This only clears
-        what's on screen - the shell process itself (its cwd, environment,
-        and command history) keeps running untouched, exactly like a real
-        terminal's own "clear" command."""
-        terminal_area.delete("1.0", "end")
-        terminal_area.mark_set("term_cursor", "1.0")
-        terminal_area.mark_gravity("term_cursor", "left")
+    def clear_output():
+        """Wipes the Output panel."""
         output_area.config(state="normal")
         output_area.delete("1.0", tk.END)
         output_area.config(state="disabled")
 
-    # Every keystroke is forwarded raw to the shell; the widget's own
-    # editing/self-insert is always suppressed ("break") so the buffer only
-    # ever shows what the shell itself echoes back - keeping it byte-for-byte
-    # consistent with a real terminal, including its own backspace handling.
-    KEY_SEQUENCES = {
-        "Return": "\r",
-        "BackSpace": "\x7f",
-        "Tab": "\t",
-        "Up": "\x1b[A",
-        "Down": "\x1b[B",
-        "Right": "\x1b[C",
-        "Left": "\x1b[D",
-        "Home": "\x1b[H",
-        "End": "\x1b[F",
-        "Delete": "\x1b[3~",
-        "Escape": "\x1b",
-    }
-
-    def terminal_key(event):
-        if not terminal_state["alive"]:
-            return "break"
-
-        keysym = event.keysym
-
-        if event.state & 0x4 and keysym.lower() == "c":  # Ctrl+C -> interrupt
-            _term_send_raw("\x03")
-            return "break"
-        if event.state & 0x4 and keysym.lower() == "d":  # Ctrl+D -> EOF (POSIX)
-            _term_send_raw("\x04")
-            return "break"
-
-        if keysym in KEY_SEQUENCES:
-            _term_send_raw(KEY_SEQUENCES[keysym])
-            return "break"
-
-        if event.char and event.char.isprintable():
-            _term_send_raw(event.char)
-            return "break"
-
-        # Unhandled key (modifier-only presses, function keys, etc.) - let it
-        # pass through harmlessly without touching the buffer ourselves.
-        return "break"
-
-    terminal_area.bind("<KeyPress>", terminal_key)
-
-    init_terminal()
-
-    def focus_terminal():
-        bottom_panel.select(terminal_tab)
-        terminal_area.focus_set()
-        terminal_area.mark_set("insert", "end")
-        terminal_area.see("end")
-
-    def on_bottom_panel_tab_changed(event=None):
-        # Clicking the "Terminal" tab only switches which panel is visible -
-        # it doesn't move keyboard focus by itself, so without this a typed
-        # command (and Enter) would silently go to whatever had focus before
-        # (usually the code editor) instead of the terminal.
-        try:
-            selected = bottom_panel.select()
-        except tk.TclError:
-            return
-        if selected == str(terminal_tab):
-            terminal_area.focus_set()
-            terminal_area.mark_set("insert", "end")
-            terminal_area.see("end")
-
-    bottom_panel.bind("<<NotebookTabChanged>>", on_bottom_panel_tab_changed)
 
     # ---------- Current-tab helpers ----------
     def get_current_tab():
@@ -2844,6 +2529,7 @@ def run():
             with open(editor["path"], "w", encoding="utf-8") as f:
                 f.write(editor["text"].get("1.0", "end-1c"))
             mark_clean(editor)
+            refresh_git_state()
         else:
             save_editor_as(editor)
 
@@ -2861,6 +2547,7 @@ def run():
         mark_clean(editor)
         update_status_bar(editor)
         refresh_tree()
+        refresh_git_state()
         _remember_recent_file(path)
 
     def prompt_save_if_dirty(editor, tab_id):
@@ -2982,6 +2669,34 @@ def run():
 
     tab_control.bind("<Button-2>", on_tab_middle_click)
 
+    # ---------- Click-to-close (the little "x" on each tab) ----------
+    # Standard ttk recipe: press arms the close element only if the press
+    # actually landed on it, release fires the close only if the button
+    # comes back up over that same element on the same tab - so a press
+    # that drags off the "x" before releasing (or lands elsewhere) doesn't
+    # close anything, same as a normal button.
+    tab_close_state = {"pressed_tab": None}
+
+    def on_tab_close_press(event):
+        elem = tab_control.identify(event.x, event.y)
+        if "close" not in elem:
+            tab_close_state["pressed_tab"] = None
+            return
+        tab_close_state["pressed_tab"] = tab_id_at_event(event)
+        tab_control.state(["pressed"])
+
+    def on_tab_close_release(event):
+        if tab_close_state["pressed_tab"] is None:
+            return
+        elem = tab_control.identify(event.x, event.y)
+        tab_control.state(["!pressed"])
+        if "close" in elem and tab_id_at_event(event) == tab_close_state["pressed_tab"]:
+            close_tab(tab_close_state["pressed_tab"])
+        tab_close_state["pressed_tab"] = None
+
+    tab_control.bind("<ButtonPress-1>", on_tab_close_press)
+    tab_control.bind("<ButtonRelease-1>", on_tab_close_release)
+
     tab_context_menu = tk.Menu(tab_control, tearoff=0, **menu_opts)
 
     def show_tab_context_menu(event):
@@ -3057,8 +2772,19 @@ def run():
             _remember_recent_file(path)
             return
 
-        with open(path, "r", encoding="utf-8") as f:
-            content = f.read()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except UnicodeDecodeError:
+            messagebox.showerror(
+                "Open File",
+                f"Couldn't open '{os.path.basename(path)}': it doesn't look like a "
+                "UTF-8 text file (it may be binary, or use a different encoding)."
+            )
+            return
+        except OSError as e:
+            messagebox.showerror("Open File", f"Couldn't open '{os.path.basename(path)}': {e}")
+            return
 
         current = get_current_editor()
         # Reuse a blank, untouched "Untitled" tab instead of piling up empty ones
@@ -3146,6 +2872,7 @@ def run():
             project_tree.delete(children[0])
             path = project_tree.item(node, "values")[0]
             add_directory(node, path)
+            apply_git_status_tags()
 
     project_tree.bind("<<TreeviewOpen>>", _on_tree_expand)
 
@@ -3173,6 +2900,7 @@ def run():
         project_path = folder
         populate_tree(folder)
         highlight_active_file()
+        refresh_git_state()
 
     # ---------- Drag and drop ----------
     # Only active when tkinterdnd2 is installed (see the optional import at
@@ -3190,6 +2918,7 @@ def run():
                 project_path = dropped_path
                 populate_tree(dropped_path)
                 highlight_active_file()
+                refresh_git_state()
             elif os.path.isfile(dropped_path):
                 try:
                     _open_path_in_tab(dropped_path)
@@ -3211,6 +2940,17 @@ def run():
         for node in project_tree.get_children(parent):
             yield node
             yield from _walk_tree_nodes(node)
+
+    def _node_tags(node):
+        """Tk's Treeview.item(node, "tags") returns a tuple when there are
+        0 or 2+ tags, but a bare string when there's exactly 1 - normalize
+        to always-a-tuple so tag logic elsewhere doesn't have to special-
+        case that (that mismatch is what caused the "can only concatenate
+        str (not tuple) to str" crash in apply_git_status_tags)."""
+        tags = project_tree.item(node, "tags")
+        if isinstance(tags, str):
+            return (tags,) if tags else ()
+        return tuple(tags)
 
     def _get_expanded_paths():
         expanded = set()
@@ -3249,21 +2989,79 @@ def run():
         """Tag whichever explorer row backs the file open in the current
         tab, so it's visually obvious which file you're editing - and
         clear the tag everywhere else first, since ttk.Treeview doesn't
-        do this automatically."""
+        do this automatically. Only touches the "active_file" tag itself
+        (rather than wiping every tag on the row) so it doesn't clobber
+        the git status tags apply_git_status_tags() applies separately."""
         editor = get_current_editor()
         path = editor["path"] if editor else None
         for node in _walk_tree_nodes():
-            if project_tree.item(node, "tags"):
-                project_tree.item(node, tags=())
+            tags = _node_tags(node)
+            if "active_file" in tags:
+                project_tree.item(node, tags=tuple(t for t in tags if t != "active_file"))
         if not path:
             return
         norm_path = os.path.normpath(path)
         for node in _walk_tree_nodes():
             values = project_tree.item(node, "values")
             if values and os.path.normpath(values[0]) == norm_path:
-                project_tree.item(node, tags=("active_file",))
+                tags = _node_tags(node)
+                project_tree.item(node, tags=tags + ("active_file",))
                 project_tree.see(node)
                 return
+
+    def apply_git_status_tags():
+        """Recolors explorer rows to reflect `git status` - accent for
+        staged files, an attention color for modified-but-unstaged files,
+        and a muted-green for untracked ones. Cheap enough to call after
+        every tree refresh/save; does nothing if project_path isn't
+        inside a git repo (or no folder is open at all)."""
+        git_tags = ("git_staged", "git_modified", "git_untracked")
+
+        def _clear(node):
+            tags = _node_tags(node)
+            kept = tuple(t for t in tags if t not in git_tags)
+            if kept != tags:
+                project_tree.item(node, tags=kept)
+
+        if not project_path:
+            for node in _walk_tree_nodes():
+                _clear(node)
+            return
+
+        repo_root = git_panel.find_repo_root(project_path)
+        if not repo_root:
+            for node in _walk_tree_nodes():
+                _clear(node)
+            return
+
+        status = git_panel.get_status(repo_root)
+        if status.get("error"):
+            for node in _walk_tree_nodes():
+                _clear(node)
+            return
+
+        def _abs_paths(entries):
+            return {os.path.normpath(os.path.join(repo_root, p)) for _, p in entries}
+
+        staged_paths = _abs_paths(status["staged"])
+        modified_paths = _abs_paths(status["unstaged"])
+        untracked_paths = _abs_paths(status["untracked"])
+
+        for node in _walk_tree_nodes():
+            values = project_tree.item(node, "values")
+            _clear(node)
+            if not values:
+                continue
+            path = os.path.normpath(values[0])
+            if path in staged_paths:
+                tag = "git_staged"
+            elif path in modified_paths:
+                tag = "git_modified"
+            elif path in untracked_paths:
+                tag = "git_untracked"
+            else:
+                continue
+            project_tree.item(node, tags=_node_tags(node) + (tag,))
 
     def refresh_tree(select_path=None):
         if not project_path:
@@ -3274,6 +3072,7 @@ def run():
         if select_path:
             _select_tree_path(select_path)
         highlight_active_file()
+        apply_git_status_tags()
 
     # Catches files created/deleted/renamed outside the app (another
     # editor, git, a terminal command) by refreshing whenever the window
@@ -3282,6 +3081,7 @@ def run():
     def _on_app_focus_in(event):
         if event.widget is root:
             refresh_tree()
+            git_controls["refresh"]()
 
     root.bind("<FocusIn>", _on_app_focus_in)
 
@@ -3476,29 +3276,26 @@ def run():
 
     # ---------- Run code ----------
     # Runs the file through the same live shell backing the Terminal tab
-    # (a real WSL/bash session), instead of a one-shot subprocess whose
-    # output could only be captured after the fact. That means a program
-    # asking for input() (or reading stdin generally) actually gets it,
-    # the same as running it in a real terminal by hand. The Output panel
-    # still gets the plain, un-annotated printed output too - see the
-    # start/end marker handling in _term_feed_with_mirror above.
-    RUNNERS = {
-        "Python": "python3",
-        "JavaScript": "node",
-        "Shell Script": "bash",
-    }
+    # ---------- Run ----------
+    # Spawns the program in its own console window (see _spawn_run_console
+    # above) - the same handoff Code::Blocks/Dev-C++ do - rather than
+    # piping it through an embedded shell. Interactive input (input(),
+    # Console.ReadLine(), etc.) just works, since it's a real console.
+    if IS_WINDOWS:
+        RUNNERS = {
+            "Python": "python",
+            "JavaScript": "node",
+        }
+    else:
+        RUNNERS = {
+            "Python": "python3",
+            "JavaScript": "node",
+            "Shell Script": "bash",
+        }
 
     def run_code():
         editor = get_current_editor()
         if not editor:
-            return
-
-        if not terminal_state["alive"]:
-            messagebox.showinfo(
-                "Run",
-                "The terminal isn't running, so there's nowhere to run this. "
-                "Open the Terminal tab first."
-            )
             return
 
         if editor["path"]:
@@ -3507,11 +3304,11 @@ def run():
                 return  # save was cancelled/failed
             run_path = editor["path"]
         else:
-            # Unsaved buffer - drop it next to the shell's own working
-            # directory so no Windows<->WSL path translation is needed,
-            # then just reference it by filename.
+            # Unsaved buffer - drop it next to the project folder (or
+            # CodeForge's own cwd) so there's a real file to point the
+            # spawned console at.
             with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".py", dir=os.getcwd(), delete=False
+                mode="w", suffix=".py", dir=_project_cwd(), delete=False
             ) as tmp:
                 tmp.write(editor["text"].get("1.0", "end-1c"))
                 run_path = tmp.name
@@ -3523,39 +3320,40 @@ def run():
             )
             return
 
-        try:
-            rel_path = os.path.relpath(run_path, os.getcwd())
-        except ValueError:
-            rel_path = run_path  # e.g. different drive on Windows
-        shell_path = rel_path.replace(os.sep, "/")
-
-        run_id = uuid.uuid4().hex[:8]
-        # "$$" (the shell's own PID) is expanded only when the line actually
-        # *runs* - the terminal's local echo of what we typed still shows
-        # the literal "$$", so matching for digits here can't confuse the
-        # keystroke echo with the real, executed marker.
-        run_state["start_marker"] = re.compile(f"RUNSOF_{run_id}P" + r"\d+")
-        run_state["end_marker"] = re.compile(f"RUNEOF_{run_id}P" + r"\d+")
-        run_state["start_prefix"] = f"RUNSOF_{run_id}P"
-        run_state["end_prefix"] = f"RUNEOF_{run_id}P"
-        run_state["buffer"] = ""
-        run_state["scan_pending"] = ""
-        run_state["active"] = False
-        run_state["awaiting_start"] = True
+        run_dir = os.path.dirname(run_path) or _project_cwd()
+        filename = os.path.basename(run_path)
 
         output_area.config(state="normal")
         output_area.delete("1.0", tk.END)
-        output_area.insert("1.0", "Running...\n")
+        output_area.insert("1.0", f"Running {filename} in a separate window...\n")
         output_area.config(state="disabled")
+        bottom_panel.select(output_tab)
 
-        focus_terminal()
-        _term_print(f"{interpreter} {shell_path}\n")
-        command = (
-            f"echo RUNSOF_{run_id}P$$; "
-            f"{interpreter} {shlex.quote(shell_path)}; "
-            f"echo RUNEOF_{run_id}P$$\r"
-        )
-        _term_send_raw(command)
+        try:
+            proc = _spawn_run_console(interpreter, filename, run_dir)
+        except Exception as e:
+            output_area.config(state="normal")
+            output_area.insert(tk.END, f"\nFailed to launch: {e}\n")
+            output_area.config(state="disabled")
+            return
+
+        run_state["proc"] = proc
+
+        def wait_for_exit(p=proc):
+            code = p.wait()
+
+            def report():
+                # A newer Run may have started (and finished) while this
+                # one's console window was still open - only report if
+                # this is still the process anyone would care about.
+                if run_state.get("proc") is p:
+                    output_area.config(state="normal")
+                    output_area.insert(tk.END, f"\n[process exited with code {code}]\n")
+                    output_area.config(state="disabled")
+
+            root.after(0, report)
+
+        threading.Thread(target=wait_for_exit, daemon=True).start()
 
     # ---------- Find / Replace ----------
     find_state = {
@@ -3976,7 +3774,6 @@ def run():
                 return
         stop_focus_session()
         save_current_session()
-        stop_shell()
         root.destroy()
 
     def _switch_theme_and_relaunch(new_theme_name):
@@ -3998,7 +3795,6 @@ def run():
         save_theme_preference(new_theme_name)
         save_current_session()
 
-        stop_shell()
         root.destroy()
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
@@ -4188,10 +3984,10 @@ def run():
     run_menu.add_command(label="Run", command=run_code, accelerator="F5")
     run_menu.add_command(label="Kill", command=kill_running)
     run_menu.add_separator()
-    run_menu.add_command(label="Clear Terminal", command=clear_terminal, accelerator="Ctrl+K")
+    run_menu.add_command(label="Clear Output", command=clear_output, accelerator="Ctrl+K")
 
     view_menu = tk.Menu(root, tearoff=0, **menu_opts)
-    view_menu.add_command(label="Terminal", command=focus_terminal, accelerator="Ctrl+`")
+    view_menu.add_command(label="Open Terminal", command=open_external_terminal, accelerator="Ctrl+`")
     view_menu.add_separator()
     view_menu.add_command(label="Zoom In", command=zoom_in, accelerator="Ctrl++")
     view_menu.add_command(label="Zoom Out", command=zoom_out, accelerator="Ctrl+-")
@@ -4279,10 +4075,10 @@ def run():
     root.bind("<Control-s>", lambda e: save_file())
     root.bind("<Control-w>", lambda e: close_tab())
     root.bind("<F5>", lambda e: run_code())
-    root.bind("<Control-k>", lambda e: clear_terminal())
+    root.bind("<Control-k>", lambda e: clear_output())
     root.bind("<Control-f>", lambda e: open_find_replace("find"))
     root.bind("<Control-h>", lambda e: open_find_replace("replace"))
-    root.bind("<Control-grave>", lambda e: focus_terminal())
+    root.bind("<Control-grave>", lambda e: open_external_terminal())
     root.bind("<Control-Shift-D>", lambda e: cycle_theme())
     root.bind("<Control-Shift-d>", lambda e: cycle_theme())
     root.bind("<Control-plus>", lambda e: zoom_in())
@@ -4339,6 +4135,7 @@ def run():
     if saved_folder and os.path.isdir(saved_folder):
         project_path = saved_folder
         populate_tree(saved_folder)
+        refresh_git_state()
 
     for saved_path in session.get("open_files", []):
         if not saved_path or not os.path.isfile(saved_path):
