@@ -117,6 +117,15 @@ except ImportError:
     import goto
 
 try:
+    # hover_defs.py is being imported as part of the "editor" package.
+    from . import hover_defs
+except ImportError:
+    # Standalone script - plain import, same fallback pattern as themes
+    # above.
+    import hover_defs
+
+
+try:
     # plugins.py is being imported as part of the "editor" package.
     from . import plugins
 except ImportError:
@@ -972,7 +981,8 @@ def run():
             "EditorTabs.TNotebook.Tab",
             background=THEME["panel_header_bg"],
             foreground=THEME["panel_header_fg"],
-            padding=(10, 4, 6, 4),
+            padding=(16, 9, 12, 9),
+            font=("Segoe UI", 10),
             borderwidth=0,
             bordercolor=THEME["border"],
             lightcolor=THEME["panel_header_bg"],
@@ -983,7 +993,13 @@ def run():
             background=[("selected", THEME["editor_bg"])],
             foreground=[("selected", THEME["editor_fg"])],
             lightcolor=[("selected", THEME["editor_bg"])],
-            darkcolor=[("selected", THEME["editor_bg"])]
+            darkcolor=[("selected", THEME["editor_bg"])],
+            # clam's built-in Tab element shrinks the padding on
+            # non-selected tabs (and by extension makes the selected one
+            # look bigger/smaller relative to it depending on platform) -
+            # pin padding to the same fixed size in every state so the
+            # bigger tab size above always holds, regardless of selection.
+            padding=[("selected", (16, 9, 12, 9)), ("!selected", (16, 9, 12, 9))],
         )
 
         for orientation in ("Vertical", "Horizontal"):
@@ -1690,7 +1706,14 @@ def run():
         if bottom_y is None:
             tab_indicator.place_forget()
             return
-        tab_indicator.place(x=0, y=bottom_y, relwidth=1.0, height=3)
+        # y is the bottom edge of the tab strip / top edge of the editor
+        # content (line-number gutter, fold gutter, text). The indicator
+        # bar itself needs to stay *above* that line - not start there and
+        # extend downward into it - so its top is offset up by its own
+        # height, leaving its bottom edge flush with the boundary instead
+        # of painting over the top few pixels of the gutter/content below.
+        indicator_height = 3
+        tab_indicator.place(x=0, y=bottom_y - indicator_height, relwidth=1.0, height=indicator_height)
         # Every editor tab frame is added as a sibling *after* this canvas,
         # which would otherwise draw on top of it (later-added siblings win
         # the stacking order), so it needs raising above whichever tab frame
@@ -2780,6 +2803,7 @@ def run():
     # pixel width of the specific span it's underlining, so this measures
     # bbox() at both ends of the diagnostic instead of a fixed column.
     LINT_HOVER_DELAY_MS = 300
+    DEF_HOVER_DELAY_MS = 350
 
     def _lint_diag_span(text_area, diag):
         """The (start_index, end_index) run of text a diagnostic should be
@@ -2978,6 +3002,124 @@ def run():
         def on_leave(event, ed=editor):
             cancel_hover_job(ed)
             hide_lint_tooltip(ed)
+
+        text_area.bind("<Motion>", on_motion, add="+")
+        text_area.bind("<Leave>", on_leave, add="+")
+
+    # ---------- Definition-on-hover ----------
+    # Same shape as the lint hover above (debounced <Motion>, a floating
+    # Toplevel as the tooltip), but answering "where is this name defined"
+    # instead of "what's wrong with this span" - see hover_defs.py for how
+    # that lookup actually works per language.
+    _DEF_KIND_LABELS = {
+        "function": "function", "async function": "async function",
+        "class": "class", "parameter": "parameter", "import": "import",
+        "exception": "exception variable", "variable": "variable",
+        "method": "method", "type": "type", "const": "const",
+        "rule": "CSS rule", "id": "HTML id",
+    }
+
+    def hide_def_tooltip(editor):
+        tooltip = editor.get("def_tooltip")
+        if tooltip is not None:
+            editor["def_tooltip"] = None
+            try:
+                tooltip.destroy()
+            except tk.TclError:
+                pass
+
+    def show_def_tooltip(editor, defn, x_root, y_root):
+        hide_def_tooltip(editor)
+        tooltip = tk.Toplevel(editor["text"])
+        tooltip.wm_overrideredirect(True)
+        tooltip.wm_geometry(f"+{x_root}+{y_root}")
+        try:
+            tooltip.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+
+        body = tk.Frame(
+            tooltip, bg=THEME["popup_bg"], highlightthickness=1,
+            highlightbackground=THEME["popup_border"], highlightcolor=THEME["popup_border"]
+        )
+        body.pack()
+
+        kind_label = _DEF_KIND_LABELS.get(defn["kind"], defn["kind"])
+        tk.Label(
+            body, text=f"{kind_label} \u00b7 line {defn['line']}",
+            bg=THEME["popup_bg"], fg=THEME["muted_fg"], anchor="w", justify="left",
+            padx=8, pady=0, font=("Segoe UI", 8, "bold")
+        ).pack(fill="x", pady=(4, 0))
+        tk.Label(
+            body, text=defn["preview"] or defn["name"],
+            bg=THEME["popup_bg"], fg=THEME["popup_fg"], anchor="w", justify="left",
+            padx=8, pady=0, font=("Consolas", 10), wraplength=420
+        ).pack(fill="x", pady=(0, 4 if not defn.get("doc") else 0))
+        if defn.get("doc"):
+            tk.Label(
+                body, text=defn["doc"],
+                bg=THEME["popup_bg"], fg=THEME["muted_fg"], anchor="w", justify="left",
+                padx=8, pady=0, font=("Segoe UI", 9, "italic"), wraplength=420
+            ).pack(fill="x", pady=(2, 4))
+
+        editor["def_tooltip"] = tooltip
+
+    def bind_definition_hover(text_area, editor):
+        def cancel_hover_job(ed=editor):
+            pending = ed.get("def_hover_job")
+            if pending is not None:
+                try:
+                    ed["text"].after_cancel(pending)
+                except tk.TclError:
+                    pass
+                ed["def_hover_job"] = None
+
+        def on_motion(event, ed=editor, ta=text_area):
+            cancel_hover_job(ed)
+
+            def check(ed=ed, ta=ta, x=event.x, y=event.y):
+                ed["def_hover_job"] = None
+                if not ta.winfo_exists():
+                    return
+                try:
+                    index = ta.index(f"@{x},{y}")
+                except tk.TclError:
+                    return
+
+                # A lint diagnostic already claims this spot - let that
+                # tooltip own it rather than racing two popups over the
+                # same corner of the screen.
+                if _diag_at_position(ed, index) is not None:
+                    return
+
+                try:
+                    word_start = ta.index(f"{index} wordstart")
+                    word_end = ta.index(f"{index} wordend")
+                    word = ta.get(word_start, word_end)
+                except tk.TclError:
+                    return
+                if not word or not (word[0].isalpha() or word[0] == "_"):
+                    hide_def_tooltip(ed)
+                    return
+
+                content = ta.get("1.0", "end-1c")
+                hover_line = int(index.split(".")[0])
+                defn = hover_defs.find_definition(ed.get("path"), content, word, hover_line)
+                if defn is None or defn["line"] == hover_line:
+                    # No match, or hovering right over the definition
+                    # itself - either way there's nothing useful to show.
+                    hide_def_tooltip(ed)
+                    return
+
+                x_root = ta.winfo_rootx() + x + 12
+                y_root = ta.winfo_rooty() + y + 20
+                show_def_tooltip(ed, defn, x_root, y_root)
+
+            ed["def_hover_job"] = ta.after(DEF_HOVER_DELAY_MS, check)
+
+        def on_leave(event, ed=editor):
+            cancel_hover_job(ed)
+            hide_def_tooltip(ed)
 
         text_area.bind("<Motion>", on_motion, add="+")
         text_area.bind("<Leave>", on_leave, add="+")
@@ -4171,6 +4313,8 @@ def run():
             "lint_pool_used": 0,
             "lint_tooltip": None,
             "lint_hover_job": None,
+            "def_tooltip": None,
+            "def_hover_job": None,
             "wrap_enabled": word_wrap_state["enabled"],
         }
         editor["fold"] = code_folding.FoldEngine(
@@ -4240,6 +4384,7 @@ def run():
             # Cheap and purely cursor-local - keep these instant so typing
             # never feels like it's waiting on anything.
             hide_lint_tooltip(ed)
+            hide_def_tooltip(ed)
             highlight_current_line(ed)
             highlight_brackets(ed["text"])
             update_status_bar(ed)
@@ -4313,6 +4458,7 @@ def run():
         bind_autocomplete(text_area, editor)
         bind_multicursor(text_area, editor)
         bind_lint_hover(text_area, editor)
+        bind_definition_hover(text_area, editor)
 
         tab_control.add(tab_frame, text=title)
         tab_control.select(tab_frame)
@@ -4439,6 +4585,15 @@ def run():
                 pass
 
         hide_lint_tooltip(editor)
+
+        pending = editor.get("def_hover_job")
+        if pending is not None:
+            try:
+                editor["text"].after_cancel(pending)
+            except tk.TclError:
+                pass
+
+        hide_def_tooltip(editor)
 
         ac = editor.get("autocomplete")
         if ac and ac.get("close"):
