@@ -1,0 +1,29 @@
+# CodeForge dependencies
+#
+# The app runs fine with NONE of these installed - every one is wrapped in
+# a try/except ImportError in app.py / music_player.py and the affected
+# feature just shows an install hint instead of crashing. Install what you
+# want the shipped build to actually support; leave the rest out to keep
+# the exe smaller.
+
+# --- Drag-and-drop file/folder support onto the tab bar and project tree ---
+tkinterdnd2==0.4.3
+
+# --- Background music tab (YouTube audio playback) ---
+# yt-dlp: pure Python, resolves playlist/video info and stream URLs.
+yt-dlp>=2024.12.13
+# python-vlc: just the bindings. The actual VLC engine (libvlc) is NOT a
+# pip package - see NOTE below and the .spec file's docstring.
+python-vlc==3.0.21203
+
+# --- Build tool (not a runtime dependency, needed only to produce the exe) ---
+pyinstaller>=6.10
+
+# ---------------------------------------------------------------------------
+# NOTE on python-vlc:
+# This only gives you the ctypes bindings. For the Music tab to actually
+# play audio - both when running from source AND in a packaged exe - VLC
+# itself must be installed on the machine (https://www.videolan.org/vlc/),
+# or you must bundle libvlc.dll / libvlccore.dll / the plugins/ folder
+# next to the exe yourself. See codeforge.spec for where those go.
+# ---------------------------------------------------------------------------

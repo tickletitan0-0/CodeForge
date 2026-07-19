@@ -18,6 +18,9 @@ import shutil
 import sys
 import threading
 import shlex
+import time
+import pathlib
+import webbrowser
 
 try:
     # app.py is being imported as part of the "editor" package (e.g. main.py
@@ -28,8 +31,11 @@ try:
         load_session, save_session,
         load_font_size_preference, save_font_size_preference,
         DEFAULT_FONT_SIZE, MIN_FONT_SIZE, MAX_FONT_SIZE,
-        is_dark_theme,
-        load_recent_files, save_recent_files, MAX_RECENT_FILES
+        load_font_family_preference, save_font_family_preference,
+        DEFAULT_FONT_FAMILY, FONT_FAMILY_CHOICES,
+        is_dark_theme, blend_hex,
+        load_recent_files, save_recent_files, MAX_RECENT_FILES,
+        load_stats, save_stats
     )
 except ImportError:
     # app.py is being run directly as a standalone script - fall back to a
@@ -40,8 +46,11 @@ except ImportError:
         load_session, save_session,
         load_font_size_preference, save_font_size_preference,
         DEFAULT_FONT_SIZE, MIN_FONT_SIZE, MAX_FONT_SIZE,
-        is_dark_theme,
-        load_recent_files, save_recent_files, MAX_RECENT_FILES
+        load_font_family_preference, save_font_family_preference,
+        DEFAULT_FONT_FAMILY, FONT_FAMILY_CHOICES,
+        is_dark_theme, blend_hex,
+        load_recent_files, save_recent_files, MAX_RECENT_FILES,
+        load_stats, save_stats
     )
 
 try:
@@ -70,6 +79,28 @@ except ImportError:
     # Standalone script - plain import, same fallback pattern as themes
     # above.
     import git_panel
+
+try:
+    # linters.py is being imported as part of the "editor" package.
+    from . import linters
+except ImportError:
+    # Standalone script - plain import, same fallback pattern as themes
+    # above.
+    import linters
+
+
+def resource_path(filename):
+    """Path to a bundled non-Python file (currently just icon.png), that
+    works both running from source and as a frozen PyInstaller build.
+
+    Source: files live next to this script.
+    Frozen (onedir): PyInstaller's collect step copies datas from the spec
+    into the same folder as the exe, and sys._MEIPASS points there - so
+    the two cases actually resolve to the same "next to the executable"
+    location, this just picks the right base dir for each.
+    """
+    base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_dir, filename)
 
 
 # ---------------- Theme ----------------
@@ -372,6 +403,16 @@ def _offset_to_index(offset, starts):
     return f"{line + 1}.{col}"
 
 
+def _offset_to_index_in_window(offset, starts, window_start_line):
+    """Same as _offset_to_index, but for a regex match found in a
+    *windowed* substring (some padded range of lines, not the whole
+    document) - shifts the resulting line number back to the real
+    document line the window started at."""
+    idx = _offset_to_index(offset, starts)
+    line_str, col_str = idx.split(".", 1)
+    return f"{int(line_str) + window_start_line - 1}.{col_str}"
+
+
 # ---------------- Autocompletion ----------------
 # Dot-completion (os.path.j -> join, ...) needs to actually import whatever
 # module is being completed on so it can introspect its real attributes.
@@ -524,6 +565,19 @@ def run():
 
     root = tkinterdnd2.TkinterDnD.Tk() if tkinterdnd2 else tk.Tk()
     root.title("CodeForge")
+
+    # Window/taskbar icon. Wrapped in try/except since a missing or
+    # corrupt icon.png shouldn't be able to stop the app from starting -
+    # worst case you just get Tk's default feather icon instead.
+    try:
+        _icon_img = tk.PhotoImage(file=resource_path("icon.png"))
+        root.iconphoto(True, _icon_img)
+        # Keep a reference somewhere that outlives this function's locals
+        # so Tk doesn't garbage-collect the image out from under itself.
+        root._icon_img_ref = _icon_img
+    except (tk.TclError, FileNotFoundError):
+        pass
+
     root.geometry("800x600")  # fallback size if maximizing isn't supported
     _maximize_window(root)
     root.config(bg=THEME["app_bg"], highlightthickness=0, bd=0)
@@ -582,6 +636,33 @@ def run():
         lightcolor=[("selected", THEME["editor_bg"])],
         darkcolor=[("selected", THEME["editor_bg"])]
     )
+
+    # Used by the Settings dialog's font/theme dropdowns.
+    style.configure(
+        "Settings.TCombobox",
+        fieldbackground=THEME["popup_bg"],
+        background=THEME["panel_header_bg"],
+        foreground=THEME["popup_fg"],
+        arrowcolor=THEME["panel_header_fg"],
+        bordercolor=THEME["border"],
+        lightcolor=THEME["popup_bg"],
+        darkcolor=THEME["popup_bg"],
+        selectbackground=THEME["popup_bg"],
+        selectforeground=THEME["popup_fg"],
+        insertcolor=THEME["editor_insert"],
+        padding=4,
+    )
+    style.map(
+        "Settings.TCombobox",
+        fieldbackground=[("readonly", THEME["popup_bg"])],
+        foreground=[("readonly", THEME["popup_fg"])],
+        selectbackground=[("readonly", THEME["popup_bg"])],
+        selectforeground=[("readonly", THEME["popup_fg"])],
+    )
+    root.option_add("*TCombobox*Listbox.background", THEME["popup_bg"])
+    root.option_add("*TCombobox*Listbox.foreground", THEME["popup_fg"])
+    root.option_add("*TCombobox*Listbox.selectBackground", THEME["popup_select_bg"])
+    root.option_add("*TCombobox*Listbox.selectForeground", THEME["popup_select_fg"])
 
     # Editor tabs get their own style (rather than restyling "TNotebook.Tab"
     # globally) so the little close "x" only shows up on file tabs - the
@@ -692,23 +773,231 @@ def run():
         "activebackground": THEME["editor_select_bg"],
         "activeforeground": THEME["editor_select_fg"],
         "disabledforeground": THEME["muted_fg"],
+        "border": THEME["popup_border"],
         "relief": "flat",
         "borderwidth": 0,
         "activeborderwidth": 0,
     }
+
+    # ---------------- Themed dropdown menus ----------------
+    # Even with borderwidth/relief above zeroed out, a real tk.Menu popup on
+    # Windows still shows a thick light outline around the whole dropdown -
+    # that ring is the OS's own popup-window chrome, not anything Tk paints,
+    # and (confirmed the hard way) Menu doesn't support highlightthickness/
+    # highlightbackground the way most widgets do, so there's no widget
+    # option that reaches it.
+    #
+    # This gives dropdown menus the same treatment already used for the menu
+    # STRIP (custom Menubuttons instead of native chrome) and the
+    # autocomplete popup (a plain Toplevel(overrideredirect=True) holding a
+    # Frame with our own highlightthickness/highlightbackground border): a
+    # window with zero OS-drawn chrome at all, so the border is entirely
+    # ours to color. Only the slice of tk.Menu's API actually used elsewhere
+    # in this file is implemented: add_command/add_separator/add_cascade,
+    # entryconfig (label/state), index(END), delete(0, END), and
+    # popup/tk_popup/grab_release.
+    class ThemedMenu:
+        _open_stack = []  # every currently-open ThemedMenu, root first
+
+        def __init__(self, master, tearoff=0, **opts):
+            self.master = master
+            self.opts = opts
+            self.items = []
+            self.toplevel = None
+            self.row_widgets = []
+            self._child = None
+
+        def add_command(self, label="", command=None, accelerator="", state="normal"):
+            self.items.append({
+                "type": "command", "label": label, "command": command,
+                "accelerator": accelerator, "state": state,
+            })
+
+        def add_separator(self):
+            self.items.append({"type": "separator"})
+
+        def add_cascade(self, label="", menu=None):
+            self.items.append({"type": "cascade", "label": label, "menu": menu, "state": "normal"})
+
+        def delete(self, start, end=None):
+            self.items = []
+
+        def index(self, _end):
+            return len(self.items) - 1
+
+        def entryconfig(self, idx, label=None, state=None):
+            item = self.items[idx]
+            if label is not None:
+                item["label"] = label
+            if state is not None:
+                item["state"] = state
+            if idx < len(self.row_widgets) and self.row_widgets[idx][0] is not None:
+                lbl = self.row_widgets[idx][0]
+                if label is not None:
+                    lbl.config(text=self._display_text(item))
+                self._style_row(lbl, item)
+
+        def grab_release(self):
+            # No-op - kept so call sites that mirror the old
+            # tk_popup(...) + grab_release() pattern don't need to change.
+            pass
+
+        def tk_popup(self, x, y):
+            self.popup(x, y)
+
+        def close(self):
+            if self._child is not None:
+                self._child.close()
+                self._child = None
+            if self.toplevel is not None:
+                try:
+                    self.toplevel.destroy()
+                except tk.TclError:
+                    pass
+                self.toplevel = None
+                self.row_widgets = []
+            if self in ThemedMenu._open_stack:
+                ThemedMenu._open_stack.remove(self)
+
+        @classmethod
+        def close_all(cls):
+            for m in list(cls._open_stack):
+                m.close()
+            cls._open_stack.clear()
+
+        def _display_text(self, item):
+            text = item["label"]
+            if item.get("accelerator"):
+                text = text + ("  " * 3) + item["accelerator"]
+            return text
+
+        def _style_row(self, lbl, item, active=False):
+            if item.get("state") == "disabled":
+                lbl.config(bg=self.opts["bg"], fg=self.opts.get("disabledforeground", "#888888"))
+            elif active:
+                lbl.config(bg=self.opts["activebackground"], fg=self.opts["activeforeground"])
+            else:
+                lbl.config(bg=self.opts["bg"], fg=self.opts["fg"])
+
+        def popup(self, x, y, _root_menu=True):
+            if _root_menu:
+                ThemedMenu.close_all()
+            self.close()
+
+            border_color = self.opts.get("border", self.opts["bg"])
+            top = tk.Toplevel(self.master)
+            top.wm_overrideredirect(True)
+            try:
+                top.attributes("-topmost", True)
+            except tk.TclError:
+                pass
+
+            frame = tk.Frame(
+                top, bg=self.opts["bg"], bd=0,
+                highlightthickness=1, highlightbackground=border_color, highlightcolor=border_color,
+            )
+            frame.pack()
+
+            self.row_widgets = []
+            self._child = None
+
+            for item in self.items:
+                if item["type"] == "separator":
+                    sep = tk.Frame(frame, bg=border_color, height=1)
+                    sep.pack(fill="x", padx=6, pady=3)
+                    self.row_widgets.append((None, sep))
+                    continue
+
+                lbl = tk.Label(
+                    frame, text=self._display_text(item), anchor="w",
+                    bg=self.opts["bg"], padx=14, pady=4, cursor="hand2",
+                )
+                self._style_row(lbl, item)
+                lbl.pack(fill="x")
+                self.row_widgets.append((lbl, lbl))
+
+                if item.get("state") == "disabled":
+                    continue
+
+                def on_enter(e, i=item, l=lbl):
+                    self._style_row(l, i, active=True)
+
+                def on_leave(e, i=item, l=lbl):
+                    self._style_row(l, i, active=False)
+
+                lbl.bind("<Enter>", on_enter)
+                lbl.bind("<Leave>", on_leave)
+
+                if item["type"] == "command":
+                    def on_click(e, it=item):
+                        cmd = it.get("command")
+                        ThemedMenu.close_all()
+                        if cmd:
+                            cmd()
+                        return "break"
+                    lbl.bind("<Button-1>", on_click)
+                elif item["type"] == "cascade":
+                    def on_click(e, it=item, l=lbl):
+                        self._open_cascade(it, l)
+                        return "break"
+                    lbl.bind("<Button-1>", on_click)
+
+            top.update_idletasks()
+            w, h = top.winfo_reqwidth(), top.winfo_reqheight()
+            sw, sh = top.winfo_screenwidth(), top.winfo_screenheight()
+            if x + w > sw:
+                x = max(0, sw - w)
+            if y + h > sh:
+                y = max(0, sh - h)
+            top.wm_geometry(f"+{x}+{y}")
+
+            self.toplevel = top
+            ThemedMenu._open_stack.append(self)
+            top.bind("<Escape>", lambda e: ThemedMenu.close_all())
+
+        def _open_cascade(self, item, label_widget):
+            submenu = item.get("menu")
+            if submenu is None:
+                return
+            if self._child is not None:
+                self._child.close()
+            x = label_widget.winfo_rootx() + label_widget.winfo_width()
+            y = label_widget.winfo_rooty()
+            submenu.popup(x, y, _root_menu=False)
+            self._child = submenu
+
+    def _themed_menu_dismiss(event):
+        # A single app-wide click watcher rather than a per-menu grab, so
+        # hovering back and forth between a cascade (Open Recent, Theme) and
+        # its parent doesn't fight over an exclusive grab. Clicking anywhere
+        # that isn't inside one of the currently-open menu windows closes
+        # all of them.
+        if not ThemedMenu._open_stack:
+            return
+        try:
+            clicked_top = event.widget.winfo_toplevel()
+        except tk.TclError:
+            clicked_top = None
+        for m in ThemedMenu._open_stack:
+            if m.toplevel is not None and clicked_top is m.toplevel:
+                return
+        ThemedMenu.close_all()
+
+    root.bind_all("<Button-1>", _themed_menu_dismiss, add="+")
 
     # ---------------- Custom menu bar ----------------
     # A native tk.Menu's top-level STRIP is drawn by the OS on Windows and
     # ignores bg/fg entirely (only the dropdowns that open from it respect
     # theme colors) - that's what left the "File Edit Run View" row stuck
     # white even in dark mode. Building the strip ourselves out of themed
-    # Menubuttons (each still posting a themed tk.Menu dropdown) fixes that
-    # completely. It's packed here, before the status bar/main pane, so it
-    # claims the top strip; the actual Menubuttons/dropdowns are filled in
-    # near the end of run() once their commands (new_file, save_file, etc.)
-    # exist.
+    # Menubuttons (each still posting a themed ThemedMenu dropdown) fixes
+    # that completely. It's packed here, before the status bar/main pane, so
+    # it claims the top strip; the actual Menubuttons/dropdowns are filled
+    # in near the end of run() once their commands (new_file, save_file,
+    # etc.) exist.
     menu_bar_frame = tk.Frame(root, bg=THEME["panel_header_bg"], highlightthickness=0, bd=0)
     menu_bar_frame.pack(side="top", fill="x")
+
 
     # ---------------- Status bar ----------------
     # Packed (not just created) before the main paned window so it reserves
@@ -737,6 +1026,19 @@ def run():
         padx=10
     )
     status_position_label.pack(side="left")
+
+    # Squiggly-line diagnostic summary for whichever tab is active - kept
+    # in sync by update_lint_status_label(), called from the same places
+    # (re-lint completing, tab switch) that update the squiggles themselves.
+    status_lint_label = tk.Label(
+        status_bar,
+        text="",
+        bg=THEME["panel_header_bg"],
+        fg=THEME["muted_fg"],
+        anchor="w",
+        padx=10
+    )
+    status_lint_label.pack(side="left")
 
     # Mirrors whatever's loaded in the Music tab so you can see/skip
     # tracks without switching off the tab you're actually working in.
@@ -777,6 +1079,21 @@ def run():
         padx=10
     )
     status_focus_label.pack(side="left")
+
+    # Live "time spent coding this session" - ticks up on its own further
+    # down once the rest of run() (root, after()) exists; clicking it
+    # jumps to the Stats tab for the full picture (all-time totals, commit
+    # counts) instead of cramming all of that into the status bar itself.
+    status_timer_label = tk.Label(
+        status_bar,
+        text="\u23F1 0m",
+        bg=THEME["panel_header_bg"],
+        fg=THEME["panel_header_fg"],
+        anchor="w",
+        padx=10,
+        cursor="hand2"
+    )
+    status_timer_label.pack(side="left")
 
     status_filetype_label = tk.Label(
         status_bar,
@@ -852,7 +1169,8 @@ def run():
         sashrelief="flat",
         sashwidth=4,
         bd=0,
-        bg=THEME["app_bg"]
+        bg=THEME["app_bg"],
+        opaqueresize=False,
     )
     main_frame.pack(fill="both", expand=True)
 
@@ -889,17 +1207,108 @@ def run():
     tab_control = ttk.Notebook(center_frame, style="EditorTabs.TNotebook")
     tab_control.pack(fill="both", expand=True)
 
+    # ---------- Sliding tab-bottom indicator ----------
+    # A thin accent-colored bar that glides to the selected tab instead of
+    # the selection just jumping there (VS Code / browser-tab style). Kept
+    # as a plain Canvas floated on top of the notebook via place() - ttk
+    # doesn't expose the tab strip as its own widget to pack something
+    # below, but placing a child directly on the Notebook and positioning
+    # it in pixel coordinates works the same way a floating scrollbar would.
+    tab_indicator = tk.Canvas(
+        tab_control, height=3, highlightthickness=0, bd=0, bg=THEME["editor_bg"]
+    )
+    tab_indicator_bar = tab_indicator.create_rectangle(
+        0, 0, 0, 3, fill=THEME["accent"], width=0
+    )
+    tab_indicator_state = {"anim_job": None}
+
+    def _tab_strip_bottom_y():
+        tabs = tab_control.tabs()
+        if not tabs:
+            return None
+        try:
+            bbox = tab_control.bbox(tabs[0])
+        except tk.TclError:
+            return None
+        if not bbox:
+            return None
+        _, y, _, h = bbox
+        return y + h
+
+    def _animate_tab_indicator(target_x, target_w, duration_ms=140):
+        pending = tab_indicator_state["anim_job"]
+        if pending is not None:
+            tab_indicator.after_cancel(pending)
+            tab_indicator_state["anim_job"] = None
+
+        x1, _, x2, _ = tab_indicator.coords(tab_indicator_bar)
+        start_x, start_w = x1, x2 - x1
+        steps = max(1, duration_ms // 16)
+        progress = {"i": 0}
+
+        def step():
+            progress["i"] += 1
+            t = min(1.0, progress["i"] / steps)
+            eased = 1 - (1 - t) ** 3  # ease-out cubic - quick start, soft landing
+            cur_x = start_x + (target_x - start_x) * eased
+            cur_w = start_w + (target_w - start_w) * eased
+            tab_indicator.coords(tab_indicator_bar, cur_x, 0, cur_x + cur_w, 3)
+            if t < 1.0:
+                tab_indicator_state["anim_job"] = tab_indicator.after(16, step)
+            else:
+                tab_indicator_state["anim_job"] = None
+
+        step()
+
+    def update_tab_indicator(animate=True):
+        bottom_y = _tab_strip_bottom_y()
+        if bottom_y is None:
+            tab_indicator.place_forget()
+            return
+        tab_indicator.place(x=0, y=bottom_y, relwidth=1.0, height=3)
+        # Every editor tab frame is added as a sibling *after* this canvas,
+        # which would otherwise draw on top of it (later-added siblings win
+        # the stacking order), so it needs raising above whichever tab frame
+        # is currently showing. Canvas overrides *both* .lift() and
+        # .tkraise() as aliases for its own tag_raise() (a canvas-item op
+        # that expects a tag/id argument, not widget-stacking) - so neither
+        # Python method can be used here. Call Tcl's `raise` directly on
+        # the widget path instead, bypassing the shadowed methods entirely.
+        tab_indicator.tk.call("raise", tab_indicator._w)
+
+        current_tab = tab_control.select()
+        if not current_tab:
+            return
+        try:
+            x, _, w, _ = tab_control.bbox(current_tab)
+        except tk.TclError:
+            return
+
+        if animate:
+            _animate_tab_indicator(x, w)
+        else:
+            tab_indicator.coords(tab_indicator_bar, x, 0, x + w, 3)
+
+    # Covers window resize/first mapping - individual tab positions don't
+    # shift on resize (tabs are label-sized, not stretched), but the strip's
+    # bottom y isn't known correctly until the notebook is actually mapped.
+    tab_control.bind("<Configure>", lambda e: update_tab_indicator(animate=False), add="+")
+
     project_path = None
     tab_editors = {}       # tab widget name (str) -> editor dict
     untitled_count = [0]   # counter used to name new blank tabs
 
-    # Editor font size - shared across all tabs (like most editors' zoom),
-    # persisted so it's restored on next launch. Kept in a dict rather than
-    # a bare variable so nested functions can mutate it without `nonlocal`.
-    font_state = {"size": load_font_size_preference()}
+    # Editor font size/family - shared across all tabs (like most editors'
+    # zoom), persisted so it's restored on next launch. Kept in a dict rather
+    # than bare variables so nested functions can mutate them without
+    # `nonlocal`.
+    font_state = {
+        "size": load_font_size_preference(),
+        "family": load_font_family_preference(),
+    }
 
     def current_editor_font():
-        return ("Consolas", font_state["size"])
+        return (font_state["family"], font_state["size"])
 
     # Recently-opened files, most-recent first - persisted so "Open Recent"
     # survives a restart. Kept in a dict (like font_state) so nested
@@ -919,11 +1328,35 @@ def run():
     # of the strip empty underneath.
     MINIMAP_ROW_HEIGHT = 3
 
+    # Minimap git-heatmap - a thin strip along the minimap's right edge
+    # marking rows that contain lines added/modified since HEAD (or, for
+    # an untracked file, the whole thing). Shares the same on/off-toggle
+    # pattern as minimap_state. The actual `git diff` subprocess call is
+    # too slow to run on every keystroke, so it's only ever done by
+    # refresh_minimap_heat() (save/commit/tab-switch triggered, threaded)
+    # - render_minimap_content() just paints whatever's cached in each
+    # editor's "git_heat" entry, which means the heatmap reflects the
+    # last-saved contents vs HEAD rather than unsaved in-buffer edits.
+    MINIMAP_HEAT_WIDTH = 4
+    git_heatmap_state = {"visible": True}
+
     # CRT Scanlines - off by default so it doesn't surprise anyone who
     # just picks the CRT theme for the colors. Shared across tabs like
     # minimap_state, for the same reason (new tabs need to match whatever
     # was last chosen).
     crt_state = {"scanlines": False}
+
+    # ---------------- Session timer / usage stats ----------------
+    # session_stats tracks *this run* (elapsed time, commits made this
+    # session); the cumulative all-time totals live on disk via
+    # load_stats/save_stats and get flushed periodically below rather than
+    # only on a clean exit, so a crash or the theme-switch relaunch
+    # (root.destroy() + os.execv) doesn't lose whatever hasn't been saved.
+    session_stats = {
+        "start": time.time(),
+        "last_flush": time.time(),
+        "commits": 0,
+    }
 
     # ---------------- Output / Terminal panel ----------------
 
@@ -1051,12 +1484,34 @@ def run():
         else:
             status_music_label.config(text="")
 
-    music_controls = music_player.build_music_panel(
-        music_tab, THEME, on_track_change=_update_music_status_label
-    )
+    music_controls = {}
+    music_panel_state = {"built": False}
+
+    def _ensure_music_panel_built():
+        # Actually constructing the panel is what triggers music_player's
+        # lazy yt-dlp/vlc import - deferring this call to first-tab-visit
+        # (rather than building it eagerly like every other bottom-panel
+        # tab) is the whole point: most sessions never touch Music at all,
+        # so most launches now skip that import cost entirely.
+        if music_panel_state["built"]:
+            return
+        music_panel_state["built"] = True
+        music_controls.update(music_player.build_music_panel(
+            music_tab, THEME, on_track_change=_update_music_status_label
+        ))
+
+    def _on_bottom_panel_tab_changed(event=None):
+        try:
+            current_tab_text = bottom_panel.tab(bottom_panel.select(), "text")
+        except tk.TclError:
+            return
+        if "Music" in current_tab_text:
+            _ensure_music_panel_built()
+
+    bottom_panel.bind("<<NotebookTabChanged>>", _on_bottom_panel_tab_changed, add="+")
 
     def _focus_music_tab(event=None):
-        bottom_panel.select(music_tab)
+        bottom_panel.select(music_tab)  # fires <<NotebookTabChanged>> above, which builds the panel if needed
 
     status_music_label.bind("<Button-1>", _focus_music_tab)
 
@@ -1082,6 +1537,8 @@ def run():
         get_project_path=lambda: project_path,
         on_status_change=_update_git_status_label,
         on_open_file=lambda p: _open_path_in_tab(p),
+        on_repo_cloned=lambda p: _open_project_folder(p),
+        on_commit=lambda: _record_commit(),
     )
 
     def _focus_git_tab(event=None):
@@ -1097,6 +1554,114 @@ def run():
         changed."""
         git_controls["refresh"]()
         apply_git_status_tags()
+        for ed in tab_editors.values():
+            refresh_minimap_heat(ed)
+
+    # ---- Stats tab (session timer + all-time totals) ----
+    # A small "fun but honest" dashboard: nothing here is computed by
+    # polling anything expensive - session numbers are just time.time()
+    # math and an in-memory counter, and the all-time numbers are read
+    # straight off the same persisted stats dict the periodic flush below
+    # writes to.
+    stats_tab = tk.Frame(bottom_panel, bg=THEME["output_bg"])
+    bottom_panel.add(stats_tab, text="\U0001F4CA Stats")
+
+    def _format_duration(total_seconds):
+        total_seconds = int(total_seconds)
+        hrs, rem = divmod(total_seconds, 3600)
+        mins, secs = divmod(rem, 60)
+        if hrs:
+            return f"{hrs}h {mins}m"
+        if mins:
+            return f"{mins}m {secs}s"
+        return f"{secs}s"
+
+    def _make_stat_row(label_text):
+        row = tk.Frame(stats_tab, bg=THEME["output_bg"])
+        row.pack(fill="x", padx=16, pady=(14, 0))
+        tk.Label(
+            row, text=label_text, bg=THEME["output_bg"], fg=THEME["muted_fg"], anchor="w"
+        ).pack(side="left")
+        value_label = tk.Label(
+            row, text="-", bg=THEME["output_bg"], fg=THEME["output_fg"],
+            anchor="e", font=("Consolas", 11, "bold")
+        )
+        value_label.pack(side="right")
+        return value_label
+
+    stats_session_time_value = _make_stat_row("This session")
+    stats_total_time_value = _make_stat_row("Total time coded")
+    stats_session_commits_value = _make_stat_row("Commits this session")
+    stats_total_commits_value = _make_stat_row("Total commits")
+
+    tk.Frame(stats_tab, bg=THEME["border"], height=1).pack(fill="x", padx=16, pady=14)
+
+    stats_fun_label = tk.Label(
+        stats_tab, text="", bg=THEME["output_bg"], fg=THEME["accent"],
+        anchor="w", padx=16, wraplength=360, justify="left"
+    )
+    stats_fun_label.pack(fill="x")
+
+    _FUN_STAT_MILESTONES = (
+        (60 * 60 * 10, "Double digits! 10+ hours in CodeForge."),
+        (60 * 60 * 5, "5 hours coded - halfway to double digits."),
+        (60 * 60, "Past the 1-hour mark."),
+    )
+
+    def refresh_stats_panel():
+        session_elapsed = time.time() - session_stats["start"]
+        persisted = load_stats()
+        # persisted["total_seconds"] only holds *previous* runs' time as of
+        # the last flush - add this session's elapsed time so the total
+        # shown is accurate between flushes instead of jumping every 30s.
+        all_time_seconds = persisted["total_seconds"] + session_elapsed
+        all_time_commits = persisted["total_commits"]
+
+        stats_session_time_value.config(text=_format_duration(session_elapsed))
+        stats_total_time_value.config(text=_format_duration(all_time_seconds))
+        stats_session_commits_value.config(text=str(session_stats["commits"]))
+        stats_total_commits_value.config(text=str(all_time_commits))
+
+        for threshold, message in _FUN_STAT_MILESTONES:
+            if all_time_seconds >= threshold:
+                stats_fun_label.config(text="\u2728 " + message)
+                break
+        else:
+            stats_fun_label.config(text="")
+
+    def _focus_stats_tab(event=None):
+        bottom_panel.select(stats_tab)
+        refresh_stats_panel()
+
+    status_timer_label.bind("<Button-1>", _focus_stats_tab)
+
+    def _record_commit():
+        session_stats["commits"] += 1
+        stats = load_stats()
+        stats["total_commits"] = stats["total_commits"] + 1
+        save_stats(stats)
+        refresh_stats_panel()
+
+    def _flush_session_stats():
+        """Roll this run's elapsed-since-last-flush time into the
+        persisted all-time total. Called on a timer (not just at exit) so
+        a crash or the theme-switch relaunch (root.destroy() + os.execv)
+        only ever loses at most one flush interval's worth of time."""
+        now = time.time()
+        delta = now - session_stats["last_flush"]
+        session_stats["last_flush"] = now
+        stats = load_stats()
+        stats["total_seconds"] = stats["total_seconds"] + delta
+        save_stats(stats)
+
+    def _tick_session_timer():
+        elapsed = time.time() - session_stats["start"]
+        hrs, rem = divmod(int(elapsed), 3600)
+        mins = rem // 60
+        status_timer_label.config(text=f"\u23F1 {hrs}h {mins}m" if hrs else f"\u23F1 {mins}m")
+        _flush_session_stats()
+        refresh_stats_panel()
+        root.after(30000, _tick_session_timer)
 
     main_frame.add(output_frame, width=300, minsize=150, stretch="never")
 
@@ -1160,35 +1725,40 @@ def run():
         except Exception as e:
             messagebox.showerror("Open Terminal", f"Couldn't open a terminal:\n{e}")
 
-    def _spawn_run_console(interpreter, filename, run_dir):
-        """Spawns a new console window that runs `interpreter filename`
-        (cwd=run_dir) and pauses at the end so the output stays on screen
-        - the same handoff Code::Blocks/Dev-C++ do for "Run". Returns the
-        Popen handle for the spawned process."""
+    def _spawn_run_console_multi(argv_steps, run_dir):
+        """Like _spawn_run_console, but runs a sequence of steps (each an
+        argv list, e.g. ["gcc", "main.c", "-o", "main"]) instead of a single
+        interpreter+file invocation - what compiled languages need (compile,
+        then execute), chained so a failed step (compile error) stops before
+        the next one runs, the same as shell "&&". Interpreted languages
+        still go through _spawn_run_console below, which is just this with
+        a single step.
+        """
         if IS_WINDOWS:
-            # NOT a hand-built '{interpreter} "{filename}" & ...' string -
-            # cmd.exe's own quote handling doesn't treat backslash-quote
-            # as an escape the way subprocess's list2cmdline (which runs
-            # on any string passed as a single list element) assumes it
-            # will. The two disagree on what the quotes mean, and the
-            # result is cmd.exe misparsing the whole line - which is what
-            # spliced the current directory in front of the filename with
-            # a stray quote and doubled backslashes. Passing each token as
-            # its own list element instead lets subprocess quote only the
-            # filename (and only if it actually needs it), which both
-            # subprocess and cmd.exe agree on.
+            tokens = []
+            for i, step in enumerate(argv_steps):
+                if i:
+                    tokens.append("&&")
+                tokens.extend(step)
+            # Same reasoning as the single-step Windows branch used to have:
+            # every token passed as its own list element (not pre-joined
+            # into one string) so subprocess's list2cmdline quotes only the
+            # tokens that actually need it, and cmd.exe's own parsing of
+            # "&&"/"&" as separate arguments works the way it expects.
             return subprocess.Popen(
-                ["cmd.exe", "/c", interpreter, filename, "&", "echo.", "&", "pause"],
+                ["cmd.exe", "/c"] + tokens + ["&", "echo.", "&", "pause"],
                 cwd=run_dir,
                 creationflags=subprocess.CREATE_NEW_CONSOLE,
             )
+
+        command_line = " && ".join(
+            " ".join(shlex.quote(tok) for tok in step) for step in argv_steps
+        )
+
         if sys.platform == "darwin":
-            # macOS Terminal.app can be pointed at a script file directly
-            # (a ".command" file), which is simpler and more reliable than
-            # driving it via osascript.
             script = (
                 f"cd {shlex.quote(run_dir)}\n"
-                f"{interpreter} {shlex.quote(filename)}\n"
+                f"{command_line}\n"
                 "echo\nread -n 1 -s -r -p 'Press any key to close...'\n"
             )
             with tempfile.NamedTemporaryFile(mode="w", suffix=".command", delete=False) as tmp:
@@ -1198,7 +1768,7 @@ def run():
             return subprocess.Popen(["open", script_path])
 
         inner = (
-            f"cd {shlex.quote(run_dir)} && {interpreter} {shlex.quote(filename)}; "
+            f"cd {shlex.quote(run_dir)} && {command_line}; "
             "echo; read -n 1 -s -r -p 'Press any key to close...'"
         )
         for exe, args in (
@@ -1215,6 +1785,13 @@ def run():
             "No terminal emulator found to run the program in "
             "(tried gnome-terminal, konsole, xfce4-terminal, xterm)."
         )
+
+    def _spawn_run_console(interpreter, filename, run_dir):
+        """Spawns a new console window that runs `interpreter filename`
+        (cwd=run_dir) and pauses at the end so the output stays on screen
+        - the same handoff Code::Blocks/Dev-C++ do for "Run". Returns the
+        Popen handle for the spawned process."""
+        return _spawn_run_console_multi([[interpreter, filename]], run_dir)
 
     def kill_running():
         """Force-closes the most recent Run's console window/process
@@ -1277,6 +1854,12 @@ def run():
         line_numbers.config(state="disabled")
 
     # ---------- Syntax highlighting ----------
+    # Colors for rainbow bracket-pair coloring, cycling through theme keys
+    # that already read well against the editor background (reusing them
+    # rather than adding a bracket-specific palette to every theme).
+    BRACKET_DEPTH_KEYS = ("syntax_keyword", "syntax_function", "syntax_number", "accent")
+    BRACKET_DEPTH_TAGS = tuple(f"bracket_depth_{i}" for i in range(len(BRACKET_DEPTH_KEYS)))
+
     def setup_highlight_tags(text_area):
         text_area.tag_configure("keyword", foreground=THEME["syntax_keyword"])
         text_area.tag_configure("string", foreground=THEME["syntax_string"])
@@ -1289,7 +1872,17 @@ def run():
         text_area.tag_configure("current_line", background=THEME["current_line_bg"])
         text_area.tag_lower("current_line")
 
+        # Rainbow bracket-pair coloring: each nesting depth gets its own
+        # foreground color, cycling through colors the theme already
+        # defines for syntax highlighting (so every theme gets a matching
+        # set for free instead of needing its own bracket palette).
+        for i, tag_name in enumerate(BRACKET_DEPTH_TAGS):
+            key = BRACKET_DEPTH_KEYS[i % len(BRACKET_DEPTH_KEYS)]
+            text_area.tag_configure(tag_name, foreground=THEME[key])
+
         # Highlights for the bracket under/next to the cursor and its pair.
+        # Configured after the depth tags so its background always wins
+        # over their foreground-only coloring.
         text_area.tag_configure(
             "bracket_match",
             background=THEME["bracket_match_bg"],
@@ -1310,10 +1903,33 @@ def run():
         text_area.tag_configure("crt_scanline", background=_scanline_bg())
         text_area.tag_lower("crt_scanline")
 
-    def highlight_current_line(text_area):
+    def setup_line_number_tags(line_numbers):
+        # A soft tint blended from the gutter's own background towards the
+        # accent color for the band, plus full accent + bold for the digits
+        # themselves - reads as a glow without needing real blur/alpha,
+        # which Tk doesn't support anyway.
+        glow_bg = blend_hex(THEME["line_number_bg"], THEME["accent"], 0.16)
+        font = current_editor_font()
+        line_numbers.tag_configure(
+            "active_line_number",
+            foreground=THEME["accent"],
+            background=glow_bg,
+            font=(font[0], font[1], "bold"),
+        )
+
+    def highlight_current_line(editor):
+        text_area = editor["text"]
         text_area.tag_remove("current_line", "1.0", tk.END)
         line = text_area.index("insert").split(".")[0]
         text_area.tag_add("current_line", f"{line}.0", f"{line}.0+1line")
+
+        # Mirror onto the gutter: bright accent-colored, bold, with a soft
+        # tinted band behind it - a "glow" for the active line number, same
+        # idea as VS Code dimming every other line number.
+        line_numbers = editor.get("line_numbers")
+        if line_numbers is not None:
+            line_numbers.tag_remove("active_line_number", "1.0", tk.END)
+            line_numbers.tag_add("active_line_number", f"{line}.0", f"{line}.0+1line")
 
     # ---------- Bracket-match highlighting ----------
     BRACKET_OPENERS = {"(": ")", "[": "]", "{": "}"}
@@ -1381,6 +1997,42 @@ def run():
                     text_area.tag_add("bracket_match", index, f"{index}+1c")
                     text_area.tag_add("bracket_match", match, f"{match}+1c")
                 break
+
+    def highlight_bracket_pairs(text_area, content, starts, skip_spans):
+        # skip_spans are (start_offset, end_offset) character ranges already
+        # known to be strings/comments (collected during the syntax pass
+        # below) - brackets inside those don't count towards nesting depth,
+        # same reasoning as _is_code_position for the single-pair matcher
+        # above, just done here as a cheap sorted-list lookup instead of a
+        # tag_names() call per character since this runs over every
+        # bracket in the whole file.
+        skip_spans = sorted(skip_spans)
+        skip_starts = [s for s, _ in skip_spans]
+
+        def in_skip_span(offset):
+            if not skip_starts:
+                return False
+            i = bisect.bisect_right(skip_starts, offset) - 1
+            if i < 0:
+                return False
+            s, e = skip_spans[i]
+            return s <= offset < e
+
+        depth = 0
+        n_colors = len(BRACKET_DEPTH_TAGS)
+        for offset, ch in enumerate(content):
+            if ch not in BRACKET_OPENERS and ch not in BRACKET_CLOSERS:
+                continue
+            if in_skip_span(offset):
+                continue
+            if ch in BRACKET_OPENERS:
+                tag = BRACKET_DEPTH_TAGS[depth % n_colors]
+                depth += 1
+            else:
+                depth = max(depth - 1, 0)
+                tag = BRACKET_DEPTH_TAGS[depth % n_colors]
+            idx = _offset_to_index(offset, starts)
+            text_area.tag_add(tag, idx, f"{idx}+1c")
 
     def _clear_indent_guides(editor):
         # Reset the reuse pool for this redraw. The canvases themselves are
@@ -1515,17 +2167,114 @@ def run():
         for line in range(2, line_count + 1, 2):
             text_area.tag_add("crt_scanline", f"{line}.0", f"{line}.0+1line")
 
-    def highlight_syntax(editor):
+    SYNTAX_WINDOW_PAD_LINES = 150
+
+    def highlight_syntax(editor, changed_line=None):
+        """Dispatches to a full-document re-highlight or a fast windowed
+        one, depending on what kind of edit just happened.
+
+        changed_line=None (file just opened, theme/font change, Find &
+        Replace, etc.) always means "do the full, correct thing" - none
+        of those callers know or care about a specific edited line, so
+        there's no safe way to scope the work.
+
+        When a specific line IS known (the common "someone is typing"
+        case from on_key_release below), a full rescan is still only
+        used if the total line count changed since the last pass - that
+        covers structural edits (new/deleted lines, which can introduce
+        or remove multi-line strings/comments) with the same full
+        correctness as before. Otherwise only a padded window of lines
+        around the edit gets its token tags redone - see
+        _highlight_syntax_window's docstring for what that does and
+        doesn't cover.
+        """
+        text_area = editor["text"]
+        num_lines = int(text_area.index("end-1c").split(".")[0])
+        prev_count = editor.get("highlight_last_line_count")
+        do_full = changed_line is None or prev_count is None or prev_count != num_lines
+        editor["highlight_last_line_count"] = num_lines
+
+        if do_full:
+            _highlight_syntax_full(editor)
+        else:
+            _highlight_syntax_window(editor, changed_line, num_lines)
+
+    def _highlight_syntax_full(editor):
         text_area = editor["text"]
         for tag in ("keyword", "string", "comment", "number", "function"):
             text_area.tag_remove(tag, "1.0", tk.END)
+        for tag in BRACKET_DEPTH_TAGS:
+            text_area.tag_remove(tag, "1.0", tk.END)
         apply_crt_scanlines(editor)
+
+        content = text_area.get("1.0", tk.END)
+        starts = _line_starts(content)
+
+        profile = _get_syntax_profile(editor.get("path"))
+        # Bracket-pair depth coloring skips brackets that live inside a
+        # string or comment (e.g. a "(" in a docstring shouldn't count
+        # towards nesting) - collected here as a byproduct of the regular
+        # syntax pass instead of a second full-document tag_names() scan.
+        string_comment_spans = []
+
+        if profile:
+            for tag_name, patterns in profile.items():
+                for pattern in patterns:
+                    if isinstance(pattern, tuple):
+                        regex, group = pattern
+                    else:
+                        regex, group = pattern, 0
+                    for match in regex.finditer(content):
+                        s, e = match.start(group), match.end(group)
+                        start = _offset_to_index(s, starts)
+                        end = _offset_to_index(e, starts)
+                        text_area.tag_add(tag_name, start, end)
+                        if tag_name in ("string", "comment"):
+                            string_comment_spans.append((s, e))
+
+        highlight_bracket_pairs(text_area, content, starts, string_comment_spans)
+
+    def _highlight_syntax_window(editor, changed_line, num_lines):
+        """Fast path for the overwhelmingly common case: typing inside an
+        existing line, same total line count as the last pass. Only the
+        token tags (keyword/string/comment/number/function) get cleared
+        and reapplied, and only within a padded window of lines around
+        the edit - not the whole document. This is what actually removes
+        the per-keystroke-pause cost that used to scale with file size:
+        re-running every regex pattern over the entire buffer on every
+        typing pause, regardless of how small the actual edit was, was
+        the single biggest cost in the editor on anything but a small
+        file.
+
+        Two things are intentionally left untouched here, both with
+        bounded, self-correcting staleness:
+
+        - Bracket-depth coloring: depth is cumulative from the start of
+          the file, so it can't be correctly recomputed from a window
+          alone. It stays exactly as the last full pass drew it, which is
+          only wrong if the edit itself added/removed a bracket - and
+          that gets caught and fixed by the slower full-reconciliation
+          pass scheduled from on_key_release, shortly after typing stops.
+        - CRT scanlines: they only depend on line *count* parity, and any
+          line-count change already forces a full pass (see
+          highlight_syntax above), so scanlines can never actually go
+          stale here.
+        """
+        text_area = editor["text"]
+        window_start = max(1, changed_line - SYNTAX_WINDOW_PAD_LINES)
+        window_end = min(num_lines, changed_line + SYNTAX_WINDOW_PAD_LINES)
+
+        window_start_index = f"{window_start}.0"
+        window_end_index = f"{window_end}.0 lineend"
+
+        for tag in ("keyword", "string", "comment", "number", "function"):
+            text_area.tag_remove(tag, window_start_index, window_end_index)
 
         profile = _get_syntax_profile(editor.get("path"))
         if not profile:
-            return  # plaintext - no patterns to apply
+            return
 
-        content = text_area.get("1.0", tk.END)
+        content = text_area.get(window_start_index, window_end_index)
         starts = _line_starts(content)
 
         for tag_name, patterns in profile.items():
@@ -1535,9 +2284,291 @@ def run():
                 else:
                     regex, group = pattern, 0
                 for match in regex.finditer(content):
-                    start = _offset_to_index(match.start(group), starts)
-                    end = _offset_to_index(match.end(group), starts)
+                    s, e = match.start(group), match.end(group)
+                    start = _offset_to_index_in_window(s, starts, window_start)
+                    end = _offset_to_index_in_window(e, starts, window_start)
                     text_area.tag_add(tag_name, start, end)
+
+    # ---------- Squiggly-line diagnostics (linting) ----------
+    # Tkinter's Text widget only supports a plain straight "underline" tag,
+    # so an actual wavy squiggle has to be faked the same way the indent
+    # guides above are: a pool of tiny reusable Canvas strips, placed with
+    # pixel-exact .place(in_=text_area, ...) coordinates on top of the text
+    # rather than anything backed by a Text tag. Unlike the guides (which
+    # only care about a column's x position) each squiggle also needs the
+    # pixel width of the specific span it's underlining, so this measures
+    # bbox() at both ends of the diagnostic instead of a fixed column.
+    LINT_HOVER_DELAY_MS = 300
+
+    def _lint_diag_span(text_area, diag):
+        """The (start_index, end_index) run of text a diagnostic should be
+        underlined across. Checkers that know exactly which characters are
+        wrong (e.g. Python's SyntaxError offset) set end_col; ones that only
+        know a position (e.g. "unterminated string starting here") don't,
+        so this falls back to Tk's own word-boundary logic rather than
+        underlining just one lonely character."""
+        line = diag["line"]
+        col = diag["col"]
+        start_index = f"{line}.{col}"
+        end_col = diag.get("end_col")
+        if end_col is not None and end_col > col:
+            return start_index, f"{line}.{end_col}"
+        end_index = text_area.index(f"{start_index} wordend")
+        if text_area.compare(end_index, "<=", start_index):
+            end_index = f"{start_index}+1c"
+        return start_index, end_index
+
+    def _clear_lint_squiggles(editor):
+        editor["lint_pool_used"] = 0
+
+    def _hide_unused_lint_squiggles(editor):
+        pool = editor["lint_canvases"]
+        for canvas in pool[editor["lint_pool_used"]:]:
+            canvas.place_forget()
+
+    def _draw_lint_run(editor, x_start, x_end, y, color):
+        text_area = editor["text"]
+        width = max(int(x_end - x_start), 4)
+        amplitude = 2
+        period = 4
+        points = []
+        x = 0
+        up = True
+        while x <= width:
+            points.extend([x, 0 if up else amplitude])
+            x += period
+            up = not up
+        if len(points) < 4:
+            points = [0, amplitude, width, 0]
+
+        pool = editor["lint_canvases"]
+        idx = editor["lint_pool_used"]
+        if idx < len(pool):
+            canvas = pool[idx]
+            canvas.configure(width=width, height=amplitude + 2, bg=THEME["editor_bg"])
+            canvas.delete("all")
+        else:
+            canvas = tk.Canvas(
+                editor["editor_frame"],
+                width=width,
+                height=amplitude + 2,
+                bg=THEME["editor_bg"],
+                highlightthickness=0,
+                bd=0
+            )
+            pool.append(canvas)
+        canvas.create_line(*points, fill=color, width=1)
+        canvas.place(in_=text_area, x=x_start, y=y)
+        editor["lint_pool_used"] = idx + 1
+
+    def update_lint_squiggles(editor):
+        """Redraws the squiggle overlay for whatever's currently in
+        editor["diagnostics"] against the on-screen portion of the text -
+        called after every re-lint, and again on scroll/resize/zoom since
+        those change the pixel coordinates the previous pass computed
+        without changing the diagnostics themselves."""
+        text_area = editor["text"]
+        if not text_area.winfo_exists():
+            return
+
+        _clear_lint_squiggles(editor)
+        try:
+            diagnostics = editor.get("diagnostics") or []
+            if not diagnostics:
+                return
+
+            text_area.update_idletasks()
+            widget_height = text_area.winfo_height()
+            first_visible = int(text_area.index("@0,0").split(".")[0])
+            last_visible = int(text_area.index(f"@0,{max(widget_height - 1, 0)}").split(".")[0])
+
+            colors = {"error": THEME["lint_error"], "warning": THEME["lint_warning"]}
+
+            for diag in diagnostics:
+                line = diag.get("line", 1)
+                if line < first_visible - 1 or line > last_visible + 1:
+                    continue
+
+                line_info = text_area.dlineinfo(f"{line}.0")
+                if not line_info:
+                    continue
+
+                try:
+                    start_index, end_index = _lint_diag_span(text_area, diag)
+                    start_bbox = text_area.bbox(start_index)
+                    end_bbox = text_area.bbox(f"{end_index}-1c") or start_bbox
+                except tk.TclError:
+                    continue
+                if not start_bbox:
+                    continue
+
+                x_start = start_bbox[0]
+                x_end = end_bbox[0] + end_bbox[2]
+                if x_end <= x_start:
+                    x_end = x_start + 4
+
+                _, line_y, _, line_height, _ = line_info
+                squiggle_y = line_y + line_height - 3
+                color = colors.get(diag.get("severity"), colors["error"])
+                _draw_lint_run(editor, x_start, x_end, squiggle_y, color)
+        finally:
+            _hide_unused_lint_squiggles(editor)
+
+    def _diag_at_position(editor, index):
+        text_area = editor["text"]
+        line = int(index.split(".")[0])
+        for diag in editor.get("diagnostics") or []:
+            if diag.get("line") != line:
+                continue
+            try:
+                start_index, end_index = _lint_diag_span(text_area, diag)
+                if text_area.compare(index, ">=", start_index) and text_area.compare(index, "<", end_index):
+                    return diag
+            except tk.TclError:
+                continue
+        return None
+
+    def hide_lint_tooltip(editor):
+        tooltip = editor.get("lint_tooltip")
+        if tooltip is not None:
+            editor["lint_tooltip"] = None
+            try:
+                tooltip.destroy()
+            except tk.TclError:
+                pass
+
+    def show_lint_tooltip(editor, diag, x_root, y_root):
+        hide_lint_tooltip(editor)
+        tooltip = tk.Toplevel(editor["text"])
+        tooltip.wm_overrideredirect(True)
+        tooltip.wm_geometry(f"+{x_root}+{y_root}")
+        try:
+            tooltip.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        icon = "\u2716" if diag.get("severity") == "error" else "\u26A0"
+        tk.Label(
+            tooltip,
+            text=f"{icon} {diag.get('message', 'Problem')}",
+            bg=THEME["popup_bg"],
+            fg=THEME["popup_fg"],
+            highlightthickness=1,
+            highlightbackground=THEME["popup_border"],
+            highlightcolor=THEME["popup_border"],
+            padx=8,
+            pady=4,
+            justify="left",
+            wraplength=420,
+            font=("Consolas", 10),
+        ).pack()
+        editor["lint_tooltip"] = tooltip
+
+    def bind_lint_hover(text_area, editor):
+        def cancel_hover_job(ed=editor):
+            pending = ed.get("lint_hover_job")
+            if pending is not None:
+                try:
+                    ed["text"].after_cancel(pending)
+                except tk.TclError:
+                    pass
+                ed["lint_hover_job"] = None
+
+        def on_motion(event, ed=editor, ta=text_area):
+            cancel_hover_job(ed)
+
+            def check(ed=ed, ta=ta, x=event.x, y=event.y):
+                ed["lint_hover_job"] = None
+                if not ta.winfo_exists():
+                    return
+                try:
+                    index = ta.index(f"@{x},{y}")
+                except tk.TclError:
+                    return
+                diag = _diag_at_position(ed, index)
+                if diag is None:
+                    hide_lint_tooltip(ed)
+                    return
+                x_root = ta.winfo_rootx() + x + 12
+                y_root = ta.winfo_rooty() + y + 20
+                show_lint_tooltip(ed, diag, x_root, y_root)
+
+            ed["lint_hover_job"] = ta.after(LINT_HOVER_DELAY_MS, check)
+
+        def on_leave(event, ed=editor):
+            cancel_hover_job(ed)
+            hide_lint_tooltip(ed)
+
+        text_area.bind("<Motion>", on_motion, add="+")
+        text_area.bind("<Leave>", on_leave, add="+")
+
+    def update_lint_status_label(editor):
+        """Mirrors the active editor's diagnostic counts onto the status
+        bar, VS Code-style. Guarded against a background tab's lint pass
+        finishing after the user has already switched away from it."""
+        if editor is not get_current_editor():
+            return
+        diagnostics = editor.get("diagnostics") or []
+        errors = sum(1 for d in diagnostics if d.get("severity") == "error")
+        warnings = sum(1 for d in diagnostics if d.get("severity") == "warning")
+        if not errors and not warnings:
+            status_lint_label.config(text="\u2713 No problems", fg=THEME["muted_fg"])
+        else:
+            parts = []
+            if errors:
+                parts.append(f"\u2716 {errors}")
+            if warnings:
+                parts.append(f"\u26A0 {warnings}")
+            status_lint_label.config(text="  ".join(parts), fg=THEME["lint_error"] if errors else THEME["lint_warning"])
+
+    def run_lint(editor):
+        """(Re-)schedules a background lint pass for `editor`, debounced so
+        a fast typist doesn't spawn a subprocess (several checkers below
+        shell out to a real compiler) on every keystroke - only once
+        typing has actually paused for a moment."""
+        pending = editor.get("lint_job")
+        if pending is not None:
+            try:
+                editor["text"].after_cancel(pending)
+            except tk.TclError:
+                pass
+
+        def do_lint(ed=editor):
+            ed["lint_job"] = None
+            text_area = ed["text"]
+            if not text_area.winfo_exists():
+                return
+
+            ed["lint_seq"] = ed.get("lint_seq", 0) + 1
+            seq = ed["lint_seq"]
+            content = text_area.get("1.0", "end-1c")
+            path = ed.get("path")
+
+            def worker(seq=seq, content=content, path=path, ed=ed):
+                try:
+                    diagnostics = linters.lint(path, content)
+                except Exception:
+                    diagnostics = []
+
+                def apply(ed=ed, seq=seq, diagnostics=diagnostics):
+                    # A newer edit (and thus a newer scheduled lint pass)
+                    # has already superseded this one - drop it rather
+                    # than flash stale squiggles back onto the screen.
+                    if ed.get("lint_seq") != seq:
+                        return
+                    if not ed["text"].winfo_exists():
+                        return
+                    ed["diagnostics"] = diagnostics
+                    update_lint_squiggles(ed)
+                    update_lint_status_label(ed)
+
+                try:
+                    ed["text"].after(0, apply)
+                except tk.TclError:
+                    pass
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        editor["lint_job"] = editor["text"].after(500, do_lint)
 
     # ---------- Minimap ----------
     # A zoomed-out overview of the whole file rendered as a strip of tiny
@@ -1573,13 +2604,30 @@ def run():
         row_count = min(total_lines, max_rows)
         lines_per_row = total_lines / row_count
 
+        # Git heatmap - reserve a thin strip on the right edge for rows
+        # whose lines were added/modified since HEAD. Uses whatever
+        # refresh_minimap_heat() last cached on this editor; see the
+        # comment by git_heatmap_state for why the actual `git diff` call
+        # doesn't happen in here.
+        heat = editor.get("git_heat") or {}
+        added_lines = heat.get("added") or set()
+        modified_lines = heat.get("modified") or set()
+        untracked = bool(heat.get("untracked"))
+        show_heat = git_heatmap_state["visible"] and (added_lines or modified_lines or untracked)
+        heat_reserve = MINIMAP_HEAT_WIDTH + 2 if show_heat else 0
+
         longest = max((len(line.rstrip()) for line in lines if line.strip()), default=0)
         longest = min(max(longest, 1), 200)
-        scale = (canvas_w - 6) / longest
+        scale = (canvas_w - 6 - heat_reserve) / longest
 
         keyword_color = THEME["syntax_keyword"]
         comment_color = THEME["syntax_comment"]
         default_color = THEME.get("muted_fg", THEME["editor_fg"])
+        # Same color language as the explorer's git status tags (see
+        # apply_git_status_tags): green for new content, amber for
+        # changed-but-preexisting content.
+        heat_added_color = THEME["syntax_comment"]
+        heat_modified_color = THEME["search_current_bg"]
 
         for row in range(row_count):
             start = int(row * lines_per_row)
@@ -1603,17 +2651,76 @@ def run():
                     else:
                         color = default_color
 
-            if color is None or max_len == 0:
-                continue
-
-            width = min(canvas_w - 6, max(2, max_len * scale))
             y = row * row_height
-            canvas.create_rectangle(
-                3, y, 3 + width, y + row_height,
-                fill=color, outline="", tags="bars"
-            )
+
+            if color is not None and max_len > 0:
+                width = min(canvas_w - 6 - heat_reserve, max(2, max_len * scale))
+                canvas.create_rectangle(
+                    3, y, 3 + width, y + row_height,
+                    fill=color, outline="", tags="bars"
+                )
+
+            if show_heat:
+                # Bucket's source lines, 1-based, inclusive.
+                bucket_first, bucket_last = start + 1, end
+                if untracked or any(
+                    l in added_lines for l in range(bucket_first, bucket_last + 1)
+                ):
+                    heat_color = heat_added_color
+                elif any(
+                    l in modified_lines for l in range(bucket_first, bucket_last + 1)
+                ):
+                    heat_color = heat_modified_color
+                else:
+                    heat_color = None
+                if heat_color:
+                    canvas.create_rectangle(
+                        canvas_w - MINIMAP_HEAT_WIDTH, y, canvas_w, y + row_height,
+                        fill=heat_color, outline="", tags="heat"
+                    )
 
         render_minimap_viewport(editor)
+
+    def refresh_minimap_heat(editor):
+        """Recomputes editor["git_heat"] against HEAD on a background
+        thread (git diff is a subprocess call - far too slow to run
+        inline from the debounced on-keystroke redraw) and repaints the
+        minimap once the result lands. Called after saves, git operations
+        (via refresh_git_state), and tab open/switch - never from typing
+        itself."""
+        text_area = editor.get("text")
+        if text_area is None or not text_area.winfo_exists():
+            return
+
+        path = editor.get("path")
+        if not path or not project_path or not git_heatmap_state["visible"]:
+            editor["git_heat"] = {"added": set(), "modified": set(), "untracked": False}
+            render_minimap_content(editor)
+            return
+
+        def worker(path=path):
+            repo_root = git_panel.find_repo_root(project_path)
+            if not repo_root:
+                result = {"added": set(), "modified": set(), "untracked": False}
+            else:
+                try:
+                    rel = os.path.relpath(path, repo_root)
+                except ValueError:
+                    rel = None
+                if rel is None:
+                    result = {"added": set(), "modified": set(), "untracked": False}
+                else:
+                    result = git_panel.diff_line_status(repo_root, rel)
+
+            def apply(ed=editor, result=result):
+                if not ed["text"].winfo_exists():
+                    return
+                ed["git_heat"] = result
+                render_minimap_content(ed)
+
+            root.after(0, apply)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def render_minimap_viewport(editor):
         canvas = editor.get("minimap")
@@ -2270,7 +3377,11 @@ def run():
         font = current_editor_font()
         editor["text"].config(font=font)
         editor["line_numbers"].config(font=font)
+        editor["line_numbers"].tag_configure(
+            "active_line_number", font=(font[0], font[1], "bold")
+        )
         update_indent_guides(editor)
+        update_lint_squiggles(editor)
 
     def set_font_size(new_size):
         new_size = max(MIN_FONT_SIZE, min(MAX_FONT_SIZE, new_size))
@@ -2280,6 +3391,15 @@ def run():
         for editor in tab_editors.values():
             apply_font_size_to_editor(editor)
         save_font_size_preference(new_size)
+
+    def set_font_family(new_family):
+        new_family = (new_family or DEFAULT_FONT_FAMILY).strip() or DEFAULT_FONT_FAMILY
+        if new_family == font_state["family"]:
+            return
+        font_state["family"] = new_family
+        for editor in tab_editors.values():
+            apply_font_size_to_editor(editor)
+        save_font_family_preference(new_family)
 
     def zoom_in():
         set_font_size(font_state["size"] + 1)
@@ -2318,6 +3438,7 @@ def run():
             font=current_editor_font()
         )
         line_numbers.pack(side="left", fill="y")
+        setup_line_number_tags(line_numbers)
 
         text_area = tk.Text(
             editor_frame,
@@ -2363,6 +3484,7 @@ def run():
             if mc and mc["cursors"]:
                 mc["draw_carets"]()
             render_minimap_viewport(editor)
+            update_lint_squiggles(editor)
 
         text_area.config(yscrollcommand=on_text_scroll)
 
@@ -2389,8 +3511,18 @@ def run():
             "guide_pool_used": 0,
             "resize_job": None,
             "highlight_job": None,
+            "full_highlight_job": None,
+            "highlight_last_line_count": None,
             "minimap_resize_job": None,
-            "last_line_count": None
+            "last_line_count": None,
+            "git_heat": {"added": set(), "modified": set(), "untracked": False},
+            "diagnostics": [],
+            "lint_job": None,
+            "lint_seq": 0,
+            "lint_canvases": [],
+            "lint_pool_used": 0,
+            "lint_tooltip": None,
+            "lint_hover_job": None,
         }
         tab_editors[tab_id] = editor
 
@@ -2436,6 +3568,7 @@ def run():
                 if mc and mc["cursors"]:
                     mc["draw_carets"]()
                 render_minimap_viewport(ed)
+                update_lint_squiggles(ed)
 
             ed["resize_job"] = ed["text"].after(120, do_redraw)
 
@@ -2453,7 +3586,8 @@ def run():
         def on_key_release(event, ed=editor):
             # Cheap and purely cursor-local - keep these instant so typing
             # never feels like it's waiting on anything.
-            highlight_current_line(ed["text"])
+            hide_lint_tooltip(ed)
+            highlight_current_line(ed)
             highlight_brackets(ed["text"])
             update_status_bar(ed)
 
@@ -2473,11 +3607,33 @@ def run():
                 if not ed["text"].winfo_exists():
                     return
                 update_line_numbers(ed)
-                highlight_syntax(ed)
+                changed_line = int(ed["text"].index(tk.INSERT).split(".")[0])
+                highlight_syntax(ed, changed_line=changed_line)
                 update_indent_guides(ed)
                 render_minimap_content(ed)
+                run_lint(ed)
 
             ed["highlight_job"] = ed["text"].after(80, do_heavy_update)
+
+            # The fast path above may have only re-highlighted a window of
+            # lines around the edit (see _highlight_syntax_window), which
+            # deliberately skips bracket-depth recoloring since depth is
+            # cumulative from the start of the file. This slower, longer
+            # debounce catches that up with a full pass once typing has
+            # actually paused for a bit, so an edit that adds/removes a
+            # bracket never stays visually wrong for more than a moment.
+            pending_full = ed.get("full_highlight_job")
+            if pending_full is not None:
+                ed["text"].after_cancel(pending_full)
+
+            def do_full_reconcile(ed=ed):
+                ed["full_highlight_job"] = None
+                if not ed["text"].winfo_exists():
+                    return
+                _highlight_syntax_full(ed)
+                ed["highlight_last_line_count"] = int(ed["text"].index("end-1c").split(".")[0])
+
+            ed["full_highlight_job"] = ed["text"].after(600, do_full_reconcile)
 
         def on_click(event, ed=editor):
             ac = ed.get("autocomplete")
@@ -2490,7 +3646,7 @@ def run():
 
             # Let the click land the cursor first, then re-highlight its line
             def refresh():
-                highlight_current_line(ed["text"])
+                highlight_current_line(ed)
                 highlight_brackets(ed["text"])
                 update_status_bar(ed)
             ed["text"].after_idle(refresh)
@@ -2509,16 +3665,19 @@ def run():
         bind_bracket_completion(text_area, editor)
         bind_autocomplete(text_area, editor)
         bind_multicursor(text_area, editor)
+        bind_lint_hover(text_area, editor)
 
         tab_control.add(tab_frame, text=title)
         tab_control.select(tab_frame)
 
         update_line_numbers(editor)
         highlight_syntax(editor)
-        highlight_current_line(text_area)
+        highlight_current_line(editor)
         highlight_brackets(text_area)
         update_indent_guides(editor)
         text_area.after_idle(lambda ed=editor: render_minimap_content(ed))
+        text_area.after_idle(lambda ed=editor: refresh_minimap_heat(ed))
+        run_lint(editor)
 
         text_area.focus_set()
 
@@ -2549,6 +3708,8 @@ def run():
         refresh_tree()
         refresh_git_state()
         _remember_recent_file(path)
+        highlight_syntax(editor)
+        run_lint(editor)
 
     def prompt_save_if_dirty(editor, tab_id):
         """Returns True if it's OK to proceed (close/exit), False to abort."""
@@ -2595,12 +3756,35 @@ def run():
             except tk.TclError:
                 pass
 
+        pending = editor.get("full_highlight_job")
+        if pending is not None:
+            try:
+                editor["text"].after_cancel(pending)
+            except tk.TclError:
+                pass
+
         pending = editor.get("minimap_resize_job")
         if pending is not None:
             try:
                 editor["minimap"].after_cancel(pending)
             except tk.TclError:
                 pass
+
+        pending = editor.get("lint_job")
+        if pending is not None:
+            try:
+                editor["text"].after_cancel(pending)
+            except tk.TclError:
+                pass
+
+        pending = editor.get("lint_hover_job")
+        if pending is not None:
+            try:
+                editor["text"].after_cancel(pending)
+            except tk.TclError:
+                pass
+
+        hide_lint_tooltip(editor)
 
         ac = editor.get("autocomplete")
         if ac and ac.get("close"):
@@ -2635,17 +3819,23 @@ def run():
         editor = get_current_editor()
         if not editor:
             update_status_bar(None)
+            status_lint_label.config(text="")
             highlight_active_file()
+            update_tab_indicator()
             return
         refresh_window_title(editor)
         update_line_numbers(editor)
         highlight_syntax(editor)
-        highlight_current_line(editor["text"])
+        highlight_current_line(editor)
         highlight_brackets(editor["text"])
         update_indent_guides(editor)
         render_minimap_content(editor)
+        refresh_minimap_heat(editor)
         update_status_bar(editor)
+        update_lint_squiggles(editor)
+        update_lint_status_label(editor)
         highlight_active_file()
+        update_tab_indicator()
         # Matches found in the previous tab don't apply to this one.
         find_state["matches"] = []
         find_state["current"] = -1
@@ -2697,7 +3887,7 @@ def run():
     tab_control.bind("<ButtonPress-1>", on_tab_close_press)
     tab_control.bind("<ButtonRelease-1>", on_tab_close_release)
 
-    tab_context_menu = tk.Menu(tab_control, tearoff=0, **menu_opts)
+    tab_context_menu = ThemedMenu(tab_control, tearoff=0, **menu_opts)
 
     def show_tab_context_menu(event):
         tab_id = tab_id_at_event(event)
@@ -2747,6 +3937,16 @@ def run():
         """
         env = os.environ.copy()
         env["CODEFORGE_NEW_WINDOW"] = "1"
+        # Same reasoning as the theme-switch relaunch: don't hand the new
+        # process this one's PyInstaller onefile temp-extraction paths.
+        # _MEIPASS2 (not _MEIPASS - that one's a sys attribute, not an env
+        # var) is the actual one that matters: PyInstaller's onefile
+        # bootloader sets it so a frozen app's own subprocess can skip
+        # re-extracting and reuse the parent's temp folder - which is
+        # exactly wrong here, since that folder disappears once the
+        # parent exits.
+        for var in ("TCL_LIBRARY", "TK_LIBRARY", "_MEIPASS2"):
+            env.pop(var, None)
         try:
             subprocess.Popen([sys.executable] + sys.argv, env=env)
         except OSError:
@@ -2798,10 +3998,11 @@ def run():
             set_tab_title(current)
             update_line_numbers(current)
             highlight_syntax(current)
-            highlight_current_line(current["text"])
+            highlight_current_line(current)
             highlight_brackets(current["text"])
             update_indent_guides(current)
             render_minimap_content(current)
+            refresh_minimap_heat(current)
             highlight_active_file()
         else:
             create_tab(path=path, content=content)
@@ -2889,18 +4090,20 @@ def run():
 
         add_directory(root_node, folder)
 
-    def open_folder():
+    def _open_project_folder(folder):
         nonlocal project_path
+        project_path = folder
+        populate_tree(folder)
+        highlight_active_file()
+        refresh_git_state()
 
+    def open_folder():
         folder = filedialog.askdirectory()
 
         if not folder:
             return
 
-        project_path = folder
-        populate_tree(folder)
-        highlight_active_file()
-        refresh_git_state()
+        _open_project_folder(folder)
 
     # ---------- Drag and drop ----------
     # Only active when tkinterdnd2 is installed (see the optional import at
@@ -2908,17 +4111,13 @@ def run():
     # no drop_target_register/dnd_bind at all, so this whole block is
     # skipped rather than erroring.
     def _on_files_dropped(event):
-        nonlocal project_path
         try:
             paths = root.tk.splitlist(event.data)
         except tk.TclError:
             return
         for dropped_path in paths:
             if os.path.isdir(dropped_path):
-                project_path = dropped_path
-                populate_tree(dropped_path)
-                highlight_active_file()
-                refresh_git_state()
+                _open_project_folder(dropped_path)
             elif os.path.isfile(dropped_path):
                 try:
                     _open_path_in_tab(dropped_path)
@@ -3086,7 +4285,7 @@ def run():
     root.bind("<FocusIn>", _on_app_focus_in)
 
     # ---------- Explorer: right-click context menu ----------
-    tree_context_menu = tk.Menu(project_tree, tearoff=0, **menu_opts)
+    tree_context_menu = ThemedMenu(project_tree, tearoff=0, **menu_opts)
 
     def tree_new_file(target_dir):
         name = simpledialog.askstring("New File", "File name:", parent=root)
@@ -3281,17 +4480,50 @@ def run():
     # above) - the same handoff Code::Blocks/Dev-C++ do - rather than
     # piping it through an embedded shell. Interactive input (input(),
     # Console.ReadLine(), etc.) just works, since it's a real console.
+    # Each entry describes how to go from "a saved file" to "something
+    # running", as a dict with a "kind":
+    #   "interpret" - run straight through an interpreter: [cmd, filename]
+    #   "compile"   - compile to a binary, then run that binary (C/C++)
+    #   "node_transform" - .ts/.tsx/.jsx can't run directly in node (no
+    #                 built-in TS/JSX support), so this reaches for the
+    #                 "tsx" package (https://github.com/privatenumber/tsx),
+    #                 a zero-config TS/JSX runner - using a global install
+    #                 if there is one, otherwise a one-off "npx -y tsx"
+    #                 (which downloads it to a cache on first use).
+    #   "java"      - javac then java, keyed off the class name (which by
+    #                 Java's own rules already has to match the filename
+    #                 for a public top-level class)
+    #   "browser"   - not run as a process at all; opened in the system's
+    #                 default web browser instead
     if IS_WINDOWS:
         RUNNERS = {
-            "Python": "python",
-            "JavaScript": "node",
+            "Python": {"kind": "interpret", "cmd": "python"},
+            "JavaScript": {"kind": "interpret", "cmd": "node"},
         }
     else:
         RUNNERS = {
-            "Python": "python3",
-            "JavaScript": "node",
-            "Shell Script": "bash",
+            "Python": {"kind": "interpret", "cmd": "python3"},
+            "JavaScript": {"kind": "interpret", "cmd": "node"},
+            "Shell Script": {"kind": "interpret", "cmd": "bash"},
         }
+    RUNNERS.update({
+        "JavaScript (React)": {"kind": "node_transform"},
+        "TypeScript": {"kind": "node_transform"},
+        "TypeScript (React)": {"kind": "node_transform"},
+        "C": {"kind": "compile", "compiler": "gcc"},
+        "C++": {"kind": "compile", "compiler": "g++"},
+        "Java": {"kind": "java"},
+        "HTML": {"kind": "browser"},
+    })
+
+    def _node_transform_steps(filename):
+        # Prefer a real "tsx" on PATH (fast, no network) - fall back to
+        # "npx -y tsx" (the "-y" skips npm's interactive "ok to install"
+        # prompt, which would otherwise sit unanswered in the spawned
+        # console) so this still works with nothing but Node installed.
+        if shutil.which("tsx"):
+            return [["tsx", filename]]
+        return [["npx", "-y", "tsx", filename]]
 
     def run_code():
         editor = get_current_editor()
@@ -3313,15 +4545,42 @@ def run():
                 tmp.write(editor["text"].get("1.0", "end-1c"))
                 run_path = tmp.name
 
-        interpreter = RUNNERS.get(get_language_label(run_path))
-        if not interpreter:
-            messagebox.showinfo(
-                "Run", f"Don't know how to run {get_language_label(run_path)} files."
-            )
+        language = get_language_label(run_path)
+        spec = RUNNERS.get(language)
+        if not spec:
+            messagebox.showinfo("Run", f"Don't know how to run {language} files.")
             return
 
         run_dir = os.path.dirname(run_path) or _project_cwd()
         filename = os.path.basename(run_path)
+        stem = os.path.splitext(filename)[0]
+
+        if spec["kind"] == "browser":
+            # HTML isn't a process - just hand it to the system browser and
+            # leave the Output panel as-is (no console to wait on, nothing
+            # for Kill to terminate).
+            try:
+                webbrowser.open_new_tab(pathlib.Path(run_path).as_uri())
+            except Exception as e:
+                messagebox.showerror("Run", f"Couldn't open in browser:\n{e}")
+                return
+            output_area.config(state="normal")
+            output_area.delete("1.0", tk.END)
+            output_area.insert("1.0", f"Opened {filename} in your default browser.\n")
+            output_area.config(state="disabled")
+            bottom_panel.select(output_tab)
+            return
+
+        if spec["kind"] == "compile":
+            exe_name = stem + (".exe" if IS_WINDOWS else "")
+            run_token = exe_name if IS_WINDOWS else f"./{exe_name}"
+            steps = [[spec["compiler"], filename, "-o", exe_name], [run_token]]
+        elif spec["kind"] == "java":
+            steps = [["javac", filename], ["java", stem]]
+        elif spec["kind"] == "node_transform":
+            steps = _node_transform_steps(filename)
+        else:  # "interpret"
+            steps = [[spec["cmd"], filename]]
 
         output_area.config(state="normal")
         output_area.delete("1.0", tk.END)
@@ -3330,7 +4589,7 @@ def run():
         bottom_panel.select(output_tab)
 
         try:
-            proc = _spawn_run_console(interpreter, filename, run_dir)
+            proc = _spawn_run_console_multi(steps, run_dir)
         except Exception as e:
             output_area.config(state="normal")
             output_area.insert(tk.END, f"\nFailed to launch: {e}\n")
@@ -3373,7 +4632,7 @@ def run():
         # refreshes don't fire for that, so do them by hand.
         update_line_numbers(editor)
         highlight_syntax(editor)
-        highlight_current_line(editor["text"])
+        highlight_current_line(editor)
         highlight_brackets(editor["text"])
         update_indent_guides(editor)
         render_minimap_content(editor)
@@ -3652,6 +4911,214 @@ def run():
         target.select_range(0, tk.END)
         live_search()
 
+    # ---------- Settings dialog ----------
+    # A single "Preferences" window for the stuff that's otherwise scattered
+    # across the View menu (font, theme, minimap/heatmap/scanlines toggles).
+    # Font family/size and the toggles apply live as you change them - same
+    # spirit as Ctrl+scroll zoom already applying immediately. Theme still
+    # goes through set_theme(), which relaunches the app (see
+    # _switch_theme_and_relaunch below), so that one's a bigger, deliberate
+    # action rather than a live preview.
+    settings_state = {"window": None}
+
+    def _installed_font_choices():
+        # Intersect the curated cross-platform shortlist with whatever's
+        # actually installed, so the dropdown never offers a font that would
+        # silently fall back to Tk's default. Always keep the current
+        # family selectable even if it isn't in the curated list or isn't
+        # detected as installed (e.g. a hand-edited settings file) - better
+        # to show an unusual value than to silently discard it.
+        try:
+            installed = set(tkfont.families(root))
+        except tk.TclError:
+            installed = set()
+        choices = [f for f in FONT_FAMILY_CHOICES if f in installed] or list(FONT_FAMILY_CHOICES)
+        current = font_state["family"]
+        if current not in choices:
+            choices = [current] + choices
+        return choices
+
+    def _build_settings_window():
+        win = tk.Toplevel(root)
+        win.title("Settings")
+        win.resizable(False, False)
+        win.transient(root)
+        win.config(bg=THEME["app_bg"], padx=14, pady=12)
+
+        label_opts = {"bg": THEME["app_bg"], "fg": THEME["panel_header_fg"]}
+        section_opts = {
+            "bg": THEME["app_bg"], "fg": THEME["muted_fg"],
+            "font": ("Consolas", 9, "bold"),
+        }
+        check_opts = {
+            "bg": THEME["app_bg"], "fg": THEME["panel_header_fg"],
+            "activebackground": THEME["app_bg"], "activeforeground": THEME["panel_header_fg"],
+            "selectcolor": THEME["editor_bg"], "highlightthickness": 0,
+        }
+        button_opts = {
+            "bg": THEME["panel_header_bg"], "fg": THEME["panel_header_fg"],
+            "activebackground": THEME["editor_select_bg"], "activeforeground": THEME["editor_fg"],
+            "relief": "flat", "highlightthickness": 0,
+        }
+
+        row = 0
+
+        def next_row():
+            nonlocal row
+            row += 1
+            return row
+
+        tk.Label(win, text="EDITOR", **section_opts).grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=(0, 4)
+        )
+
+        r = next_row()
+        tk.Label(win, text="Font family:", **label_opts).grid(row=r, column=0, sticky="w", pady=3)
+        font_family_var = tk.StringVar(value=font_state["family"])
+        font_family_box = ttk.Combobox(
+            win, textvariable=font_family_var, values=_installed_font_choices(),
+            state="readonly", style="Settings.TCombobox", width=22,
+        )
+        font_family_box.grid(row=r, column=1, columnspan=2, sticky="we", pady=3, padx=(8, 0))
+
+        r = next_row()
+        tk.Label(win, text="Font size:", **label_opts).grid(row=r, column=0, sticky="w", pady=3)
+        font_size_var = tk.IntVar(value=font_state["size"])
+        font_size_spin = tk.Spinbox(
+            win, from_=MIN_FONT_SIZE, to=MAX_FONT_SIZE, width=5,
+            textvariable=font_size_var, justify="center",
+            bg=THEME["popup_bg"], fg=THEME["popup_fg"],
+            insertbackground=THEME["editor_insert"], relief="flat",
+            highlightthickness=1, highlightbackground=THEME["border"],
+            highlightcolor=THEME["accent"], buttonbackground=THEME["panel_header_bg"],
+        )
+        font_size_spin.grid(row=r, column=1, sticky="w", pady=3, padx=(8, 0))
+
+        r = next_row()
+        preview_label = tk.Label(
+            win, text="AaBbCc 0123  the quick brown fox",
+            bg=THEME["output_bg"], fg=THEME["output_fg"],
+            anchor="w", padx=8, pady=6,
+            font=(font_state["family"], font_state["size"]),
+        )
+        preview_label.grid(row=r, column=0, columnspan=3, sticky="we", pady=(4, 8))
+
+        def _refresh_preview():
+            try:
+                size = int(font_size_var.get())
+            except (tk.TclError, ValueError):
+                return
+            preview_label.config(font=(font_family_var.get(), size))
+
+        def _on_font_family_change(*_args):
+            set_font_family(font_family_var.get())
+            _refresh_preview()
+
+        def _on_font_size_change(*_args):
+            try:
+                size = int(font_size_var.get())
+            except (tk.TclError, ValueError):
+                return
+            set_font_size(size)
+            _refresh_preview()
+
+        font_family_box.bind("<<ComboboxSelected>>", _on_font_family_change)
+        font_size_var.trace_add("write", _on_font_size_change)
+
+        tk.Label(win, text="THEME", **section_opts).grid(
+            row=next_row(), column=0, columnspan=3, sticky="w", pady=(4, 4)
+        )
+
+        r = next_row()
+        tk.Label(win, text="Color theme:", **label_opts).grid(row=r, column=0, sticky="w", pady=3)
+        theme_display_to_name = {
+            THEME_LABELS.get(name, name.replace("_", " ").title()): name
+            for name in THEMES
+        }
+        theme_var = tk.StringVar(
+            value=THEME_LABELS.get(THEME_NAME, THEME_NAME.replace("_", " ").title())
+        )
+        theme_box = ttk.Combobox(
+            win, textvariable=theme_var, values=list(theme_display_to_name.keys()),
+            state="readonly", style="Settings.TCombobox", width=22,
+        )
+        theme_box.grid(row=r, column=1, columnspan=2, sticky="we", pady=3, padx=(8, 0))
+
+        def _on_theme_change(*_args):
+            chosen = theme_display_to_name.get(theme_var.get())
+            if chosen:
+                # Relaunches the app (see _switch_theme_and_relaunch), so
+                # nothing after this line in the current process matters.
+                set_theme(chosen)
+
+        theme_box.bind("<<ComboboxSelected>>", _on_theme_change)
+
+        tk.Label(win, text="VIEW", **section_opts).grid(
+            row=next_row(), column=0, columnspan=3, sticky="w", pady=(4, 4)
+        )
+
+        minimap_var = tk.BooleanVar(value=minimap_state["visible"])
+        heatmap_var = tk.BooleanVar(value=git_heatmap_state["visible"])
+        crt_var = tk.BooleanVar(value=crt_state["scanlines"])
+
+        def _on_minimap_toggle():
+            toggle_minimap()
+            minimap_var.set(minimap_state["visible"])
+
+        def _on_heatmap_toggle():
+            toggle_git_heatmap()
+            heatmap_var.set(git_heatmap_state["visible"])
+
+        def _on_crt_toggle():
+            toggle_crt_scanlines()
+            crt_var.set(crt_state["scanlines"])
+
+        tk.Checkbutton(
+            win, text="Show minimap", variable=minimap_var,
+            command=_on_minimap_toggle, **check_opts
+        ).grid(row=next_row(), column=0, columnspan=3, sticky="w", pady=2)
+
+        tk.Checkbutton(
+            win, text="Show Git change heatmap", variable=heatmap_var,
+            command=_on_heatmap_toggle, **check_opts
+        ).grid(row=next_row(), column=0, columnspan=3, sticky="w", pady=2)
+
+        tk.Checkbutton(
+            win, text="Show CRT scanlines", variable=crt_var,
+            command=_on_crt_toggle, **check_opts
+        ).grid(row=next_row(), column=0, columnspan=3, sticky="w", pady=2)
+
+        def _reset_defaults():
+            font_family_var.set(DEFAULT_FONT_FAMILY)
+            font_size_var.set(DEFAULT_FONT_SIZE)
+            set_font_family(DEFAULT_FONT_FAMILY)
+            set_font_size(DEFAULT_FONT_SIZE)
+            _refresh_preview()
+
+        btn_frame = tk.Frame(win, bg=THEME["app_bg"])
+        btn_frame.grid(row=next_row(), column=0, columnspan=3, sticky="e", pady=(10, 0))
+        tk.Button(btn_frame, text="Reset to Defaults", command=_reset_defaults, **button_opts).pack(
+            side="left", padx=(0, 6)
+        )
+        tk.Button(btn_frame, text="Close", command=lambda: win.withdraw(), **button_opts).pack(
+            side="left"
+        )
+
+        win.columnconfigure(1, weight=1)
+        win.protocol("WM_DELETE_WINDOW", win.withdraw)
+        win.bind("<Escape>", lambda e: win.withdraw())
+
+        settings_state["window"] = win
+
+    def open_settings_dialog():
+        win = settings_state["window"]
+        if win is None or not win.winfo_exists():
+            _build_settings_window()
+            win = settings_state["window"]
+        win.deiconify()
+        win.lift()
+        win.focus_set()
+
     # ---------- Menu bar ----------
     # Each dropdown is still a real tk.Menu (so separators, accelerators,
     # etc. all work as before) - only the top-level strip that shows/posts
@@ -3702,13 +5169,13 @@ def run():
         btn.bind("<Button-1>", post_menu)
         return btn
 
-    file_menu = tk.Menu(root, tearoff=0, **menu_opts)
+    file_menu = ThemedMenu(root, tearoff=0, **menu_opts)
     file_menu.add_command(label="New Tab", command=new_file, accelerator="Ctrl+N")
     file_menu.add_command(label="New Window", command=new_window, accelerator="Ctrl+Shift+N")
     file_menu.add_command(label="Open File", command=open_file, accelerator="Ctrl+O")
     file_menu.add_command(label="Open Folder", command=open_folder)
 
-    recent_files_menu = tk.Menu(root, tearoff=0, **menu_opts)
+    recent_files_menu = ThemedMenu(root, tearoff=0, **menu_opts)
 
     def _open_recent(path):
         if not os.path.isfile(path):
@@ -3794,9 +5261,31 @@ def run():
 
         save_theme_preference(new_theme_name)
         save_current_session()
+        _flush_session_stats()
+
+        # Plain os.execv() here used to inherit the current environment
+        # as-is - harmless when running as a normal .py, but in a
+        # PyInstaller --onefile .exe the culprit is _MEIPASS2: the
+        # bootloader sets that env var so that if a onefile app spawns a
+        # subprocess of *itself*, the child can skip re-extracting and
+        # just reuse the parent's temp extraction folder. Inherited via
+        # execv/Popen, that pointed the relaunched process at a folder
+        # that disappears the moment this process's shutdown finishes
+        # cleaning up after itself - a race that only sometimes lost,
+        # matching the "Tcl data directory ... not found" reports.
+        # (TCL_LIBRARY/TK_LIBRARY aren't actually the problem - the
+        # tkinter runtime hook always overwrites those itself based on
+        # sys._MEIPASS, which is exactly why stripping only those didn't
+        # fix it last time.) Popen+exit (the same pattern "New Window"
+        # already uses) also sidesteps os.execv's flavor of process
+        # replacement, which Windows doesn't natively support anyway.
+        env = os.environ.copy()
+        for var in ("TCL_LIBRARY", "TK_LIBRARY", "_MEIPASS2"):
+            env.pop(var, None)
+        subprocess.Popen([sys.executable] + sys.argv, env=env)
 
         root.destroy()
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        sys.exit(0)
 
     def cycle_theme():
         # Steps to the next theme in THEMES' definition order, wrapping
@@ -3976,17 +5465,17 @@ def run():
 
     root.protocol("WM_DELETE_WINDOW", on_exit)
 
-    edit_menu = tk.Menu(root, tearoff=0, **menu_opts)
+    edit_menu = ThemedMenu(root, tearoff=0, **menu_opts)
     edit_menu.add_command(label="Find...", command=lambda: open_find_replace("find"), accelerator="Ctrl+F")
     edit_menu.add_command(label="Replace...", command=lambda: open_find_replace("replace"), accelerator="Ctrl+H")
 
-    run_menu = tk.Menu(root, tearoff=0, **menu_opts)
+    run_menu = ThemedMenu(root, tearoff=0, **menu_opts)
     run_menu.add_command(label="Run", command=run_code, accelerator="F5")
     run_menu.add_command(label="Kill", command=kill_running)
     run_menu.add_separator()
     run_menu.add_command(label="Clear Output", command=clear_output, accelerator="Ctrl+K")
 
-    view_menu = tk.Menu(root, tearoff=0, **menu_opts)
+    view_menu = ThemedMenu(root, tearoff=0, **menu_opts)
     view_menu.add_command(label="Open Terminal", command=open_external_terminal, accelerator="Ctrl+`")
     view_menu.add_separator()
     view_menu.add_command(label="Zoom In", command=zoom_in, accelerator="Ctrl++")
@@ -4012,6 +5501,21 @@ def run():
 
     view_menu.add_command(label="Hide Minimap", command=toggle_minimap, accelerator="Ctrl+M")
     minimap_menu_index = view_menu.index(tk.END)
+
+    def toggle_git_heatmap():
+        git_heatmap_state["visible"] = not git_heatmap_state["visible"]
+        for ed in tab_editors.values():
+            if git_heatmap_state["visible"]:
+                refresh_minimap_heat(ed)
+            else:
+                render_minimap_content(ed)
+        view_menu.entryconfig(
+            git_heatmap_menu_index,
+            label="Hide Git Heatmap" if git_heatmap_state["visible"] else "Show Git Heatmap"
+        )
+
+    view_menu.add_command(label="Hide Git Heatmap", command=toggle_git_heatmap)
+    git_heatmap_menu_index = view_menu.index(tk.END)
 
     def toggle_crt_scanlines():
         crt_state["scanlines"] = not crt_state["scanlines"]
@@ -4047,7 +5551,7 @@ def run():
     # next to whichever is currently active. Picking any entry (including
     # the active one, harmlessly - set_theme no-ops on a no-op change)
     # relaunches the app themed accordingly.
-    theme_menu = tk.Menu(root, tearoff=0, **menu_opts)
+    theme_menu = ThemedMenu(root, tearoff=0, **menu_opts)
     for theme_name in THEMES:
         label = THEME_LABELS.get(theme_name, theme_name.replace("_", " ").title())
         if theme_name == THEME_NAME:
@@ -4059,12 +5563,26 @@ def run():
         command=cycle_theme,
         accelerator="Ctrl+Shift+D"
     )
+    view_menu.add_separator()
+    view_menu.add_command(
+        label="Command Palette...",
+        command=lambda: open_command_palette(),
+        accelerator="Ctrl+Shift+P"
+    )
+
+    settings_menu = ThemedMenu(root, tearoff=0, **menu_opts)
+    settings_menu.add_command(
+        label="Preferences...",
+        command=open_settings_dialog,
+        accelerator="Ctrl+,"
+    )
 
     for label, dropdown in (
         ("File", file_menu),
         ("Edit", edit_menu),
         ("Run", run_menu),
         ("View", view_menu),
+        ("Settings", settings_menu),
     ):
         _make_menu_launcher(menu_bar_frame, label, dropdown).pack(side="left")
 
@@ -4079,6 +5597,7 @@ def run():
     root.bind("<Control-f>", lambda e: open_find_replace("find"))
     root.bind("<Control-h>", lambda e: open_find_replace("replace"))
     root.bind("<Control-grave>", lambda e: open_external_terminal())
+    root.bind("<Control-comma>", lambda e: open_settings_dialog())
     root.bind("<Control-Shift-D>", lambda e: cycle_theme())
     root.bind("<Control-Shift-d>", lambda e: cycle_theme())
     root.bind("<Control-plus>", lambda e: zoom_in())
@@ -4093,6 +5612,231 @@ def run():
     root.bind("<Control-Shift-z>", lambda e: toggle_zen_mode())
     root.bind("<Control-Shift-F>", lambda e: toggle_focus_session())
     root.bind("<Control-Shift-f>", lambda e: toggle_focus_session())
+    root.bind("<Control-Shift-P>", lambda e: open_command_palette())
+    root.bind("<Control-Shift-p>", lambda e: open_command_palette())
+
+    # ---------- Command Palette ----------
+    # Ctrl+Shift+P, VS Code style: a fuzzy-searchable list of every live
+    # menu command. Rather than maintaining a second hand-written list of
+    # "all the things you can do" alongside File/Edit/Run/View (which
+    # would inevitably drift out of sync as menu items are added/renamed),
+    # this walks the real tk.Menu objects at open-time and invokes real
+    # menu entries - so anything that shows up in a menu shows up here
+    # automatically, always current, always doing exactly what clicking
+    # it would do.
+    command_palette_state = {"window": None, "entry": None, "listbox": None,
+                              "commands": [], "filtered": []}
+
+    def _collect_menu_commands(menu, prefix=""):
+        """Walks one ThemedMenu (recursing into cascades/submenus) and
+        returns [(label, callable), ...] for every enabled, non-separator
+        entry. ThemedMenu is this app's own hand-rolled menu widget (see
+        the ThemedMenu class near the top of run()) - it keeps its
+        entries as a plain list of dicts on `.items` rather than being a
+        real tk.Menu, so this reads that list directly instead of using
+        tk.Menu's index()/type()/entrycget()/invoke() API, which
+        ThemedMenu doesn't implement."""
+        commands = []
+        for item in getattr(menu, "items", []):
+            item_type = item.get("type")
+            if item_type == "separator":
+                continue
+            label = item.get("label")
+            if not label:
+                continue
+            full_label = prefix + label
+            if item_type == "cascade":
+                submenu = item.get("menu")
+                if submenu is not None:
+                    commands.extend(_collect_menu_commands(submenu, prefix=full_label + ": "))
+                continue
+            if item.get("state") == "disabled":
+                continue
+            command = item.get("command")
+            if command is None:
+                continue
+            commands.append((full_label, command))
+        return commands
+
+    def _all_palette_commands():
+        commands = []
+        for prefix, menu in (
+            ("File", file_menu), ("Edit", edit_menu),
+            ("Run", run_menu), ("View", view_menu),
+            ("Settings", settings_menu),
+        ):
+            commands.extend(_collect_menu_commands(menu, prefix=prefix + ": "))
+        return commands
+
+    def _fuzzy_score(query, text):
+        """Subsequence fuzzy match (VS Code palette style): every
+        character of `query` must appear in `text`, in order, case-
+        insensitively. Returns None on no match; otherwise a score where
+        lower means a tighter match (consecutive/early hits beat
+        scattered ones), so results sort with the most obviously-intended
+        command first."""
+        if not query:
+            return 0
+        q = query.lower()
+        t = text.lower()
+        search_from = 0
+        score = 0
+        last_match = -1
+        for ch in q:
+            idx = t.find(ch, search_from)
+            if idx == -1:
+                return None
+            score += idx - last_match - 1
+            last_match = idx
+            search_from = idx + 1
+        return score
+
+    def _filter_palette(*_args):
+        query = command_palette_state["entry"].get().strip()
+        scored = []
+        for label, command in command_palette_state["commands"]:
+            score = _fuzzy_score(query, label)
+            if score is not None:
+                scored.append((score, label, command))
+        scored.sort(key=lambda t: (t[0], t[1]))
+        command_palette_state["filtered"] = scored
+
+        listbox = command_palette_state["listbox"]
+        listbox.delete(0, tk.END)
+        for _, label, _ in scored[:200]:
+            listbox.insert(tk.END, label)
+        if scored:
+            listbox.selection_set(0)
+
+    def _move_palette_selection(delta):
+        listbox = command_palette_state["listbox"]
+        size = listbox.size()
+        if size == 0:
+            return
+        current = listbox.curselection()
+        i = current[0] if current else -1
+        i = min(max(i + delta, 0), size - 1)
+        listbox.selection_clear(0, tk.END)
+        listbox.selection_set(i)
+        listbox.see(i)
+
+    def close_command_palette():
+        win = command_palette_state["window"]
+        if win is not None and win.winfo_exists():
+            win.destroy()
+        command_palette_state["window"] = None
+
+    def _run_selected_palette_command(event=None):
+        listbox = command_palette_state["listbox"]
+        selection = listbox.curselection()
+        if not selection:
+            return "break"
+        _, _, command = command_palette_state["filtered"][selection[0]]
+        close_command_palette()
+        # A short defer so the palette window is fully torn down (and
+        # focus restored to the main window) before the command runs -
+        # some commands (Find, Save As, ...) open their own window and
+        # want to grab focus cleanly rather than fight the closing popup.
+        root.after(10, command)
+        return "break"
+
+    def _palette_focus_out(event, win):
+        def check(win=win):
+            if command_palette_state["window"] is not win or not win.winfo_exists():
+                return
+            # Creating the window and handing focus to its entry causes a
+            # spurious FocusOut on the window itself on some platforms
+            # (focus briefly "leaves" the bare toplevel as it's handed to
+            # the entry inside it) - ignore anything in the first moment
+            # after opening so that doesn't immediately close the palette
+            # before the person even sees it.
+            if time.time() - command_palette_state.get("opened_at", 0) < 0.25:
+                return
+            focused = root.focus_get()
+            if focused is None or not str(focused).startswith(str(win)):
+                close_command_palette()
+        win.after(80, check)
+
+    def open_command_palette():
+        existing = command_palette_state["window"]
+        if existing is not None and existing.winfo_exists():
+            command_palette_state["entry"].focus_set()
+            return
+
+        win = tk.Toplevel(root)
+        win.overrideredirect(True)
+        win.config(bg=THEME["border"])
+        win.transient(root)
+
+        frame = tk.Frame(win, bg=THEME["popup_bg"])
+        frame.pack(padx=1, pady=1, fill="both", expand=True)
+
+        entry = tk.Entry(
+            frame, font=("Consolas", 12),
+            bg=THEME["popup_bg"], fg=THEME["popup_fg"],
+            insertbackground=THEME["popup_fg"],
+            relief="flat", highlightthickness=0, bd=0,
+        )
+        entry.pack(fill="x", padx=10, pady=8)
+
+        listbox = tk.Listbox(
+            frame, bg=THEME["popup_bg"], fg=THEME["popup_fg"],
+            selectbackground=THEME["popup_select_bg"], selectforeground=THEME["popup_select_fg"],
+            relief="flat", highlightthickness=0, activestyle="none",
+            height=12, font=("Consolas", 10),
+        )
+        listbox.pack(fill="both", expand=True, padx=1, pady=(0, 1))
+
+        command_palette_state.update({
+            "window": win, "entry": entry, "listbox": listbox,
+            "commands": _all_palette_commands(), "filtered": [],
+            "opened_at": time.time(),
+        })
+
+        def _position_palette():
+            if not win.winfo_exists():
+                return
+            win.update_idletasks()
+            w, h = 480, 320
+            # Relative to the app's own window, not the primary screen -
+            # winfo_screenwidth() reports the primary monitor only, so on
+            # a multi-monitor setup with the app on a different monitor
+            # that centered on the wrong screen entirely.
+            x = root.winfo_rootx() + max(0, (root.winfo_width() - w) // 2)
+            y = root.winfo_rooty() + max(0, int(root.winfo_height() * 0.12))
+            win.geometry(f"{w}x{h}+{x}+{y}")
+
+        _position_palette()
+        win.lift()
+        win.attributes("-topmost", True)
+        # Overrideredirect windows on Windows frequently ignore the very
+        # first geometry() call made before the window is actually
+        # realized/mapped, landing at whatever default position the OS
+        # picks instead - reasserting it once more a tick later is what
+        # actually sticks.
+        win.after(10, _position_palette)
+
+        def on_entry_key(event):
+            # Navigation/execution keys are handled by their own specific
+            # bindings below - re-filtering on their KeyRelease too would
+            # just redo the same query pointlessly.
+            if event.keysym in ("Up", "Down", "Return", "Escape"):
+                return
+            _filter_palette()
+
+        entry.bind("<KeyRelease>", on_entry_key)
+        entry.bind("<Down>", lambda e: (_move_palette_selection(1), "break")[1])
+        entry.bind("<Up>", lambda e: (_move_palette_selection(-1), "break")[1])
+        entry.bind("<Return>", _run_selected_palette_command)
+        entry.bind("<Escape>", lambda e: close_command_palette())
+        listbox.bind("<Double-Button-1>", _run_selected_palette_command)
+        win.bind("<FocusOut>", lambda e, w=win: _palette_focus_out(e, w))
+
+        _filter_palette()
+        # A raw focus_set() called this early can be a no-op on some
+        # platforms if the window hasn't actually been mapped by the WM
+        # yet - deferring one tick makes sure it lands.
+        win.after(10, entry.focus_set)
 
     # ---------- Media keys ----------
     # Lets you control the Music tab without switching to it. Real hardware
@@ -4157,4 +5901,14 @@ def run():
             tab_control.select(active_tab)
         highlight_active_file()
 
+    _tick_session_timer()
+
     root.mainloop()
+
+
+if __name__ == "__main__":
+    # Lets app.py work as a standalone entry point (which is what the
+    # PyInstaller build targets) in addition to being imported as
+    # `from editor import app` by a separate main.py - this guard simply
+    # doesn't fire in that import case, so both paths keep working.
+    run()

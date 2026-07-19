@@ -15,12 +15,13 @@ uses for yt-dlp/python-vlc.
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
 import threading
 import tkinter as tk
-from tkinter import messagebox, simpledialog
+from tkinter import filedialog, messagebox, simpledialog
 
 GIT_EXE = shutil.which("git")
 
@@ -174,6 +175,27 @@ def init_repo(path):
     return _run(["init"], cwd=path)
 
 
+def clone_repo(url, dest_path):
+    """Clones `url` into `dest_path` (which must not already exist - git
+    clone refuses a non-empty target). Longer timeout than other commands
+    since a clone's duration depends on repo size/network, not just local
+    disk work."""
+    parent = os.path.dirname(dest_path) or "."
+    return _run(["clone", url, dest_path], cwd=parent, timeout=180)
+
+
+def repo_name_from_url(url):
+    """Best-effort guess at the folder name `git clone` would pick on its
+    own, so the destination folder can be shown/created before the clone
+    actually runs. Handles both https://.../name.git and the scp-like
+    git@host:user/name.git form."""
+    name = url.strip().rstrip("/")
+    if name.endswith(".git"):
+        name = name[:-4]
+    name = re.split(r"[/:]", name)[-1]
+    return name or "repository"
+
+
 def diff_file(repo_root, relative_path, staged=False):
     args = ["diff", "--no-color"]
     if staged:
@@ -185,9 +207,64 @@ def diff_file(repo_root, relative_path, staged=False):
     return out or "(no differences - the file may have just been staged/unstaged)"
 
 
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def diff_line_status(repo_root, relative_path):
+    """Returns {"added": set(line_no), "modified": set(line_no), "untracked": bool}
+    - the 1-based line numbers in the *current working copy* that differ
+    from HEAD, used to paint the editor minimap's git-heatmap strip.
+
+    Parses `git diff -U0` hunk headers the same way gutter-diff plugins do:
+    a hunk with an old line count of 0 is a pure insertion (those new
+    lines are "added"); anything else that touches both old and new
+    content marks the corresponding new lines "modified". Pure deletions
+    (new count 0) have nothing left in the current file to mark, so
+    they're skipped - there's no line left to color.
+
+    Untracked files aren't part of `git diff`'s output at all, so they're
+    detected separately and reported via "untracked": True instead, with
+    both sets left empty - callers should treat that as "the whole file is
+    new" the same way the explorer's git_untracked tag does.
+
+    Returns all-empty/False on any failure (git missing, not a repo, file
+    not found, etc.) rather than raising - callers should treat that as
+    "nothing to show".
+    """
+    empty = {"added": set(), "modified": set(), "untracked": False}
+    if not GIT_EXE or not repo_root:
+        return empty
+
+    rel = relative_path.replace("\\", "/")
+
+    code, _, _ = _run(["ls-files", "--error-unmatch", "--", rel], cwd=repo_root)
+    if code != 0:
+        # Not tracked (or outside the repo) - nothing to diff against.
+        return {"added": set(), "modified": set(), "untracked": True}
+
+    code, out, _ = _run(["diff", "--no-color", "-U0", "--", rel], cwd=repo_root)
+    if code != 0 or not out:
+        return empty
+
+    added, modified = set(), set()
+    for line in out.splitlines():
+        m = _HUNK_RE.match(line)
+        if not m:
+            continue
+        old_count = int(m.group(2) or "1")
+        new_start = int(m.group(3))
+        new_count = int(m.group(4) or "1")
+        if new_count == 0:
+            continue
+        target = added if old_count == 0 else modified
+        target.update(range(new_start, new_start + new_count))
+
+    return {"added": added, "modified": modified, "untracked": False}
+
+
 # ---------------- UI ----------------
 
-def build_git_panel(parent, theme, get_project_path, on_status_change=None, on_open_file=None):
+def build_git_panel(parent, theme, get_project_path, on_status_change=None, on_open_file=None, on_repo_cloned=None, on_commit=None):
     """Builds the Source Control panel UI inside `parent`.
 
     get_project_path is a zero-arg callable returning the folder currently
@@ -202,6 +279,14 @@ def build_git_panel(parent, theme, get_project_path, on_status_change=None, on_o
 
     on_open_file(absolute_path), if given, fires on double-click of a
     file row - lets a caller open that file in an editor tab.
+
+    on_repo_cloned(absolute_path), if given, fires after "Clone
+    Repository..." finishes successfully - lets a caller open the newly
+    cloned folder as the project (populate the explorer tree, etc.),
+    the same way it would after File > Open Folder.
+
+    on_commit(), if given, fires after a commit actually succeeds - lets
+    a caller track a commit counter/stat without polling git log.
 
     Returns a dict of control functions (refresh/stage_all/etc.) - used
     by app.py to refresh the panel after saves/tree changes, the same
@@ -249,6 +334,15 @@ def build_git_panel(parent, theme, get_project_path, on_status_change=None, on_o
     msg_label.pack(anchor="w", fill="x")
     init_btn = tk.Button(msg_frame, text="Initialize Repository (git init)", **btn_opts)
     init_btn.pack(anchor="w", padx=16, pady=(0, 16))
+
+    clone_row = tk.Frame(msg_frame, bg=theme["output_bg"])
+    clone_row.pack(anchor="w", padx=16, pady=(0, 16))
+    clone_btn = tk.Button(clone_row, text="Clone Repository...", **btn_opts)
+    clone_btn.pack(side="left")
+    clone_status_label = tk.Label(
+        clone_row, text="", bg=theme["output_bg"], fg=theme["muted_fg"], padx=8,
+    )
+    clone_status_label.pack(side="left")
 
     main_frame = tk.Frame(panel, bg=theme["output_bg"])
 
@@ -505,6 +599,8 @@ def build_git_panel(parent, theme, get_project_path, on_status_change=None, on_o
                 if code == 0:
                     commit_text.delete("1.0", "end")
                     set_status_msg("Committed.")
+                    if on_commit:
+                        on_commit()
                 else:
                     set_status_msg((err or out).strip() or "Commit failed.")
                 refresh()
@@ -570,6 +666,53 @@ def build_git_panel(parent, theme, get_project_path, on_status_change=None, on_o
                     return
                 if code != 0:
                     messagebox.showerror("git init", (err or out).strip() or "Failed to initialize repository.")
+                refresh()
+
+            panel.after(0, apply)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def do_clone():
+        url = simpledialog.askstring("Clone Repository", "Repository URL:", parent=panel)
+        if not url:
+            return
+        url = url.strip()
+        if not url:
+            return
+
+        parent_dir = filedialog.askdirectory(title="Choose a folder to clone into")
+        if not parent_dir:
+            return
+
+        name = repo_name_from_url(url)
+        dest = os.path.join(parent_dir, name)
+        if os.path.exists(dest):
+            messagebox.showerror(
+                "Clone Repository",
+                f"'{name}' already exists in that folder - choose a different location "
+                "or remove/rename the existing folder first.",
+            )
+            return
+
+        clone_btn.config(state="disabled")
+        init_btn.config(state="disabled")
+        clone_status_label.config(text=f"Cloning {name}...")
+
+        def worker():
+            code, out, err = clone_repo(url, dest)
+
+            def apply():
+                clone_btn.config(state="normal")
+                init_btn.config(state="normal")
+                if not alive["value"]:
+                    return
+                if code != 0:
+                    clone_status_label.config(text="")
+                    messagebox.showerror("Clone Repository", (err or out).strip() or "Clone failed.")
+                    return
+                clone_status_label.config(text="Cloned.")
+                if on_repo_cloned:
+                    on_repo_cloned(dest)
                 refresh()
 
             panel.after(0, apply)
@@ -670,6 +813,7 @@ def build_git_panel(parent, theme, get_project_path, on_status_change=None, on_o
 
     # ---------------- Wiring ----------------
     init_btn.config(command=do_init)
+    clone_btn.config(command=do_clone)
     refresh_btn.config(command=refresh)
     pull_btn.config(command=do_pull)
     push_btn.config(command=do_push)

@@ -22,15 +22,38 @@ uses for the optional winpty/pty/tkinterdnd2 imports.
 import threading
 import tkinter as tk
 
-try:
-    import yt_dlp
-except ImportError:
-    yt_dlp = None
+# yt-dlp and python-vlc are NOT imported eagerly at module level anymore.
+# yt-dlp in particular is a genuinely slow import (it registers hundreds
+# of site extractor modules on import), so importing it just because
+# music_player.py got imported - which happened unconditionally at every
+# app startup, whether or not the user ever opened the Music tab - was
+# adding real, avoidable delay to every single launch. _load_dependencies()
+# below does the actual import lazily, on first real use, and caches the
+# result so later calls are free.
+yt_dlp = None
+vlc = None
+_dependencies_loaded = False
 
-try:
-    import vlc
-except ImportError:
-    vlc = None
+
+def _load_dependencies():
+    """Import yt-dlp/python-vlc on first actual use rather than at module
+    import time. Safe to call repeatedly - only does real work once."""
+    global yt_dlp, vlc, _dependencies_loaded
+    if _dependencies_loaded:
+        return
+    _dependencies_loaded = True
+
+    try:
+        import yt_dlp as _yt_dlp
+        yt_dlp = _yt_dlp
+    except ImportError:
+        yt_dlp = None
+
+    try:
+        import vlc as _vlc
+        vlc = _vlc
+    except ImportError:
+        vlc = None
 
 try:
     # music_player.py is being imported as part of the "editor" package.
@@ -40,7 +63,7 @@ except ImportError:
     # for themes.py.
     from themes import load_last_music_url, save_last_music_url
 
-DEPENDENCIES_OK = yt_dlp is not None and vlc is not None
+DEPENDENCIES_OK = None  # unknown until _load_dependencies() has run at least once
 
 
 class _Queue:
@@ -86,7 +109,12 @@ def build_music_panel(parent, theme, on_track_change=None):
     panel = tk.Frame(parent, bg=theme["output_bg"])
     panel.pack(fill="both", expand=True)
 
-    if not DEPENDENCIES_OK:
+    _load_dependencies()
+    dependencies_ok = yt_dlp is not None and vlc is not None
+    global DEPENDENCIES_OK
+    DEPENDENCIES_OK = dependencies_ok  # kept in sync for anything checking the module-level flag
+
+    if not dependencies_ok:
         missing = " ".join(
             name for name, mod in (("yt-dlp", yt_dlp), ("python-vlc", vlc)) if mod is None
         )

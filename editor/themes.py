@@ -56,6 +56,10 @@ LIGHT_THEME = {
     # Misc text
     "muted_fg":          "#5f6368",
 
+    # Lint diagnostics ("squiggly line" colors)
+    "lint_error":        "#e51400",
+    "lint_warning":      "#b58900",
+
     # Syntax highlighting (tuned for a white/light background)
     "syntax_keyword":    "#0000ff",
     "syntax_string":     "#a31515",
@@ -109,6 +113,10 @@ DARK_THEME = {
     # Misc text
     "muted_fg":          "#9d9d9d",
 
+    # Lint diagnostics ("squiggly line" colors)
+    "lint_error":        "#f14c4c",
+    "lint_warning":      "#cca700",
+
     # Syntax highlighting (tuned for a dark background, VS Code "Dark+"-like)
     "syntax_keyword":    "#569cd6",
     "syntax_string":     "#ce9178",
@@ -156,6 +164,10 @@ DRACULA_THEME = {
 
     "muted_fg":          "#6272a4",
 
+    # Lint diagnostics ("squiggly line" colors)
+    "lint_error":        "#ff5555",
+    "lint_warning":      "#ffb86c",
+
     "syntax_keyword":    "#ff79c6",
     "syntax_string":     "#f1fa8c",
     "syntax_comment":    "#6272a4",
@@ -200,6 +212,10 @@ MONOKAI_THEME = {
     "popup_select_fg":   "#f8f8f2",
 
     "muted_fg":          "#75715e",
+
+    # Lint diagnostics ("squiggly line" colors)
+    "lint_error":        "#f83333",
+    "lint_warning":      "#fd971f",
 
     "syntax_keyword":    "#f92672",
     "syntax_string":     "#e6db74",
@@ -247,6 +263,10 @@ NORD_THEME = {
 
     "muted_fg":          "#7b88a1",
 
+    # Lint diagnostics ("squiggly line" colors)
+    "lint_error":        "#bf616a",
+    "lint_warning":      "#ebcb8b",
+
     "syntax_keyword":    "#81a1c1",
     "syntax_string":     "#a3be8c",
     "syntax_comment":    "#4c566a",
@@ -293,6 +313,10 @@ SOLARIZED_DARK_THEME = {
 
     "muted_fg":          "#586e75",
 
+    # Lint diagnostics ("squiggly line" colors)
+    "lint_error":        "#dc322f",
+    "lint_warning":      "#b58900",
+
     "syntax_keyword":    "#859900",
     "syntax_string":     "#2aa198",
     "syntax_comment":    "#586e75",
@@ -338,6 +362,10 @@ ONE_DARK_THEME = {
 
     "muted_fg":          "#5c6370",
 
+    # Lint diagnostics ("squiggly line" colors)
+    "lint_error":        "#e06c75",
+    "lint_warning":      "#e5c07b",
+
     "syntax_keyword":    "#c678dd",
     "syntax_string":     "#98c379",
     "syntax_comment":    "#5c6370",
@@ -382,6 +410,10 @@ GITHUB_LIGHT_THEME = {
     "popup_select_fg":   "#ffffff",
 
     "muted_fg":          "#6a737d",
+
+    # Lint diagnostics ("squiggly line" colors)
+    "lint_error":        "#cb2431",
+    "lint_warning":      "#dbab09",
 
     "syntax_keyword":    "#d73a49",
     "syntax_string":     "#032f62",
@@ -432,6 +464,12 @@ CRT_THEME = {
 
     "muted_fg":          "#1f6b1f",
 
+    # Lint diagnostics ("squiggly line" colors) - a deliberate break from
+    # the monochrome phosphor palette, the same way a real terminal still
+    # shows errors in red rather than green.
+    "lint_error":        "#ff5f5f",
+    "lint_warning":      "#cccc33",
+
     # Muted so keywords/strings/etc still stand out a little from plain
     # text without breaking the monochrome phosphor feel.
     "syntax_keyword":    "#7fff7f",
@@ -476,6 +514,28 @@ DEFAULT_THEME_NAME = "light"
 DEFAULT_FONT_SIZE = 12
 MIN_FONT_SIZE = 8
 MAX_FONT_SIZE = 32
+
+# ---------------- Editor font family ----------------
+# Curated shortlist for the Settings dialog's font picker - common
+# monospace fonts likely to be installed, cross-platform. The dialog
+# intersects this with tkinter.font.families() at runtime so only fonts
+# actually present on the machine are offered (falling back to just the
+# saved/default choice if none of these happen to be installed).
+DEFAULT_FONT_FAMILY = "Consolas"
+FONT_FAMILY_CHOICES = [
+    "Consolas",
+    "Cascadia Code",
+    "Cascadia Mono",
+    "Fira Code",
+    "JetBrains Mono",
+    "Source Code Pro",
+    "Courier New",
+    "Menlo",
+    "Monaco",
+    "DejaVu Sans Mono",
+    "Ubuntu Mono",
+    "Lucida Console",
+]
 
 # Where we remember the user's last-picked theme between runs.
 _CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".codeforge")
@@ -583,6 +643,20 @@ def _hex_luminance(hex_color):
     return 0.299 * r + 0.587 * g + 0.114 * b
 
 
+def blend_hex(color_a, color_b, t):
+    """Linearly interpolate between two '#rrggbb' colors. t=0 -> color_a,
+    t=1 -> color_b. Used to make a soft tint (e.g. a glow band) from colors
+    a theme already defines, instead of hand-picking a new one per theme."""
+    a = color_a.lstrip("#")
+    b = color_b.lstrip("#")
+    ar, ag, ab = (int(a[i:i + 2], 16) for i in (0, 2, 4))
+    br, bg, bb = (int(b[i:i + 2], 16) for i in (0, 2, 4))
+    r = round(ar + (br - ar) * t)
+    g = round(ag + (bg - ag) * t)
+    bch = round(ab + (bb - ab) * t)
+    return f"#{r:02x}{g:02x}{bch:02x}"
+
+
 def is_dark_theme(name):
     """True if the named theme's background is dark enough that the app
     should be treated as a 'dark' theme (Windows title bar chrome, the
@@ -605,6 +679,52 @@ def save_font_size_preference(size):
     size = max(MIN_FONT_SIZE, min(MAX_FONT_SIZE, size))
     data = _load_settings()
     data["font_size"] = size
+    _save_settings(data)
+
+
+def load_font_family_preference():
+    """Return the saved editor font family, defaulting to DEFAULT_FONT_FAMILY.
+    Unlike font size there's no numeric range to clamp to - an installed-font
+    check happens where this is consumed (the Settings dialog), since that's
+    the only place tkinter.font.families() is available/relevant."""
+    family = _load_settings().get("font_family")
+    if not isinstance(family, str) or not family.strip():
+        return DEFAULT_FONT_FAMILY
+    return family
+
+
+def save_font_family_preference(family):
+    """Persist the chosen editor font family so it's restored on next launch."""
+    data = _load_settings()
+    data["font_family"] = family or DEFAULT_FONT_FAMILY
+    _save_settings(data)
+
+
+def load_stats():
+    """Return cumulative usage stats that outlive any single run: total
+    seconds the editor has been open, and total commits made through the
+    Source Control tab. Missing/corrupt data comes back zeroed rather than
+    raising, same tolerance as the rest of this file's loaders."""
+    stats = _load_settings().get("stats", {})
+    if not isinstance(stats, dict):
+        stats = {}
+    total_seconds = stats.get("total_seconds")
+    total_commits = stats.get("total_commits")
+    return {
+        "total_seconds": total_seconds if isinstance(total_seconds, (int, float)) else 0,
+        "total_commits": total_commits if isinstance(total_commits, int) else 0,
+    }
+
+
+def save_stats(stats):
+    """Persist the cumulative stats dict (total_seconds/total_commits).
+    Called periodically (not just on exit) so a crash or the theme-switch
+    relaunch doesn't lose whatever hasn't been flushed yet."""
+    data = _load_settings()
+    data["stats"] = {
+        "total_seconds": stats.get("total_seconds", 0),
+        "total_commits": stats.get("total_commits", 0),
+    }
     _save_settings(data)
 
 
