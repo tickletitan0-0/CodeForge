@@ -7,29 +7,25 @@ thread - see run_lint() there) and returns a list of diagnostic dicts:
     {"line": 1-based int, "col": 0-based int, "end_col": int or None,
      "severity": "error" | "warning", "message": str}
 
-Every language gets *something*, but the depth varies with what's available
-without asking the user to install anything:
+CodeForge only lints Python, JavaScript, HTML, CSS, and Java - the
+languages the editor itself supports:
 
-  - Python, JSON, and XML are checked with the standard library's own
-    parser (ast / json / xml.etree), so these are always exact and never
-    need an external tool.
-  - YAML is checked with PyYAML if it happens to be installed (optional
-    dependency, same try/except pattern app.py already uses for
-    tkinterdnd2/yt-dlp/python-vlc) - silently skipped otherwise.
-  - JavaScript, C, C++, and Shell shell out to a real toolchain (node,
-    gcc/g++, bash) *if* one is found on PATH, giving a real syntax check;
-    if the tool isn't installed, they fall back to the generic checker
-    below instead of giving up entirely.
-  - Everything else (CSS, Java, JSX/TS/TSX, SQL) and any of the above
-    without their external tool available uses a generic bracket/quote
-    balance scanner - no real grammar, but it catches the single most
-    common typo (a missing closing brace/paren/bracket or an unclosed
-    string) in basically any C-like or bracket-using language.
+  - Python is checked with the standard library's own parser (ast), so
+    it's always exact and never needs an external tool.
+  - JavaScript shells out to node --check *if* node is found on PATH,
+    giving a real syntax check; if it isn't installed, it falls back to
+    the generic checker below instead of giving up entirely.
+  - CSS and Java use a generic bracket/quote balance scanner - no real
+    grammar, but it catches the single most common typo (a missing
+    closing brace/paren/bracket or an unclosed string). Java in
+    particular would need a real javac compile (matching-filename rules,
+    a real output dir, classpath...) to get anything more, which is a lot
+    of false-positive risk for a background checker.
   - HTML gets its own lightweight tag-balance scanner instead, since its
     "brackets" are angle-bracket tag pairs, not the same three characters
     the generic scanner looks for.
-  - Markdown and plain text are prose, not syntax - there's nothing
-    correct to flag them against, so they're always clean.
+  - Plain text is prose, not syntax - there's nothing correct to flag it
+    against, so it's always clean.
 
 Nothing in here ever raises out to the caller: any unexpected failure
 (a missing tool, a weird encoding, a checker choking on something odd)
@@ -39,18 +35,11 @@ philosophy as the rest of the app's optional integrations.
 
 import ast
 import builtins
-import json
 import os
 import re
 import shutil
 import subprocess
 import tempfile
-import xml.etree.ElementTree as ET
-
-try:
-    import yaml
-except ImportError:
-    yaml = None
 
 
 _SUBPROCESS_TIMEOUT = 5  # seconds - a hung compiler shouldn't hang typing
@@ -195,52 +184,6 @@ def _lint_python_undefined_names(tree):
     return diags[:_MAX_DIAGNOSTICS]
 
 
-# ---------------- JSON (stdlib json - always available) ----------------
-def _lint_json(content):
-    try:
-        json.loads(content)
-    except json.JSONDecodeError as exc:
-        return [_diag(exc.lineno, max(exc.colno - 1, 0), exc.msg, "error")]
-    except Exception:
-        pass
-    return []
-
-
-# ---------------- XML (stdlib ElementTree - always available) ----------------
-def _lint_xml(content):
-    try:
-        ET.fromstring(content)
-    except ET.ParseError as exc:
-        line, col = exc.position
-        message = str(exc)
-        # ElementTree's message is "<reason>: line N, column M" - the
-        # position is already conveyed by line/col above, so trim the
-        # redundant suffix rather than showing it twice in the tooltip.
-        message = re.sub(r":\s*line\s+\d+,\s*column\s+\d+\s*$", "", message)
-        return [_diag(line, col, message or "XML parse error", "error")]
-    except Exception:
-        pass
-    return []
-
-
-# ---------------- YAML (optional: pip install pyyaml) ----------------
-def _lint_yaml(content):
-    if yaml is None:
-        return []
-    try:
-        for _ in yaml.safe_load_all(content):
-            pass
-    except yaml.YAMLError as exc:
-        mark = getattr(exc, "problem_mark", None)
-        message = getattr(exc, "problem", None) or str(exc).splitlines()[0]
-        if mark is not None:
-            return [_diag(mark.line + 1, mark.column, message, "error")]
-        return [_diag(1, 0, message, "error")]
-    except Exception:
-        pass
-    return []
-
-
 # ---------------- JavaScript (optional: node on PATH) ----------------
 _NODE_SYNTAX_ERROR_RE = re.compile(r"SyntaxError:\s*(.+)")
 
@@ -272,64 +215,6 @@ def _lint_javascript(content):
         content, ".js",
         lambda path: _run([node, "--check", path]),
         _parse_node_check,
-    )
-
-
-# ---------------- C / C++ (optional: gcc/g++ on PATH) ----------------
-_GCC_DIAG_RE = re.compile(r":(\d+):(\d+):\s*(error|warning):\s*(.+)")
-
-
-def _parse_gcc_output(proc, temp_path):
-    diags = []
-    prefix = temp_path + ":"
-    for line in proc.stderr.splitlines():
-        if not line.startswith(prefix):
-            continue
-        m = _GCC_DIAG_RE.match(line[len(temp_path):])
-        if not m:
-            continue
-        line_no, col_no, severity, message = m.groups()
-        diags.append(_diag(line_no, max(int(col_no) - 1, 0), message.strip(), severity))
-    return diags[:_MAX_DIAGNOSTICS]
-
-
-def _lint_c_family(content, suffix, compiler_names):
-    compiler = _first_available(compiler_names)
-    if not compiler:
-        return None
-    return _lint_via_temp_file(
-        content, suffix,
-        lambda path: _run([compiler, "-fsyntax-only", "-w", path]),
-        _parse_gcc_output,
-    )
-
-
-# ---------------- Shell (optional: bash on PATH) ----------------
-_BASH_LINE_RE = re.compile(r":\s*line\s+(\d+):\s*(.+)")
-
-
-def _parse_bash_check(proc, temp_path):
-    if proc.returncode == 0:
-        return []
-    diags = []
-    for line in proc.stderr.splitlines():
-        m = _BASH_LINE_RE.search(line)
-        if m:
-            diags.append(_diag(m.group(1), 0, m.group(2).strip(), "error"))
-    if not diags:
-        last = proc.stderr.strip().splitlines()
-        diags.append(_diag(1, 0, last[-1] if last else "Syntax error", "error"))
-    return diags
-
-
-def _lint_shell(content):
-    bash = _first_available(["bash"])
-    if not bash:
-        return None
-    return _lint_via_temp_file(
-        content, ".sh",
-        lambda path: _run([bash, "-n", path]),
-        _parse_bash_check,
     )
 
 
@@ -471,19 +356,10 @@ def _lint_html(content):
 # ---------------- Dispatch ----------------
 _EXT_LANGUAGE = {
     ".py": "python", ".pyw": "python",
-    ".json": "json",
-    ".xml": "xml",
-    ".yml": "yaml", ".yaml": "yaml",
     ".html": "html", ".htm": "html",
     ".css": "css",
     ".js": "javascript",
-    ".jsx": "jsx",
-    ".ts": "typescript", ".tsx": "tsx",
-    ".c": "c", ".h": "c",
-    ".cpp": "cpp", ".hpp": "cpp",
     ".java": "java",
-    ".sh": "shell",
-    ".sql": "sql",
 }
 
 
@@ -497,40 +373,17 @@ def lint(path, content):
     ext = os.path.splitext(path or "")[1].lower()
     language = _EXT_LANGUAGE.get(ext)
     if language is None:
-        return []  # Markdown, plain text, or anything unrecognized: no syntax to violate
+        return []  # Plain text or anything unrecognized: no syntax to violate
 
     try:
         if language == "python":
             return _lint_python(content)
-        if language == "json":
-            return _lint_json(content)
-        if language == "xml":
-            return _lint_xml(content)
-        if language == "yaml":
-            return _lint_yaml(content)
         if language == "html":
             return _lint_html(content)
         if language == "css":
             return _lint_brackets_and_quotes(content, block_comment=("/*", "*/"))
         if language == "javascript":
             diagnostics = _lint_javascript(content)
-            if diagnostics is not None:
-                return diagnostics
-            return _lint_brackets_and_quotes(content, line_comment="//", block_comment=("/*", "*/"))
-        if language in ("jsx", "typescript", "tsx"):
-            # node --check chokes on valid JSX/TS syntax (it's not plain
-            # JS), so this would flag correct code as broken - stick to
-            # the generic bracket/quote scanner for these instead.
-            return _lint_brackets_and_quotes(
-                content, line_comment="//", block_comment=("/*", "*/"), quote_chars="\"'`"
-            )
-        if language == "c":
-            diagnostics = _lint_c_family(content, ".c", ["gcc", "cc", "clang"])
-            if diagnostics is not None:
-                return diagnostics
-            return _lint_brackets_and_quotes(content, line_comment="//", block_comment=("/*", "*/"))
-        if language == "cpp":
-            diagnostics = _lint_c_family(content, ".cpp", ["g++", "c++", "clang++"])
             if diagnostics is not None:
                 return diagnostics
             return _lint_brackets_and_quotes(content, line_comment="//", block_comment=("/*", "*/"))
@@ -541,11 +394,6 @@ def lint(path, content):
             # for a background checker - the generic scanner is the safer
             # default here.
             return _lint_brackets_and_quotes(content, line_comment="//", block_comment=("/*", "*/"))
-        if language == "shell":
-            diagnostics = _lint_shell(content)
-            return diagnostics if diagnostics is not None else []
-        if language == "sql":
-            return _lint_brackets_and_quotes(content, line_comment="--", block_comment=("/*", "*/"))
     except Exception:
         return []
 

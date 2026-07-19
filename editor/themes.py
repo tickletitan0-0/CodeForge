@@ -29,7 +29,7 @@ LIGHT_THEME = {
     "editor_insert":    "#1e1e1e",
     "editor_select_bg": "#cce4ff",
     "editor_select_fg": "#000000",
-    "line_number_bg":   "#f5f5f5",
+    "line_number_bg":   "#ebebeb",
     "line_number_fg":   "#8a8a8a",
     "indent_guide":     "#e3e3e3",
 
@@ -66,6 +66,18 @@ LIGHT_THEME = {
     "syntax_comment":    "#008000",
     "syntax_number":     "#098658",
     "syntax_function":   "#795e26",
+
+    # Minimap code-shape rectangles - deliberately much lighter/subtler
+    # than the real syntax colors above. The minimap scales a single line
+    # of text up into a filled block several pixels tall, so reusing the
+    # same saturated colors used for actual on-screen text (pure blue/
+    # green) reads as a solid wall of color rather than a faint "shape of
+    # the code" preview. Other themes fall back to their normal syntax
+    # colors (see render_minimap_content in app.py), since this effect is
+    # specific to a white background.
+    "minimap_keyword":   "#c8d4ee",
+    "minimap_comment":   "#c3ddc3",
+    "minimap_default":   "#d6d6d6",
 }
 
 
@@ -86,7 +98,7 @@ DARK_THEME = {
     "editor_insert":    "#d4d4d4",
     "editor_select_bg": "#264f78",
     "editor_select_fg": "#ffffff",
-    "line_number_bg":   "#1e1e1e",
+    "line_number_bg":   "#303030",
     "line_number_fg":   "#858585",
     "indent_guide":     "#404040",
 
@@ -142,7 +154,7 @@ DRACULA_THEME = {
     "editor_insert":    "#f8f8f2",
     "editor_select_bg": "#44475a",
     "editor_select_fg": "#f8f8f2",
-    "line_number_bg":   "#282a36",
+    "line_number_bg":   "#393b46",
     "line_number_fg":   "#6272a4",
     "indent_guide":     "#3a3c4e",
 
@@ -191,7 +203,7 @@ MONOKAI_THEME = {
     "editor_insert":    "#f8f8f2",
     "editor_select_bg": "#49483e",
     "editor_select_fg": "#f8f8f2",
-    "line_number_bg":   "#272822",
+    "line_number_bg":   "#383934",
     "line_number_fg":   "#75715e",
     "indent_guide":     "#3b3c34",
 
@@ -241,7 +253,7 @@ NORD_THEME = {
     "editor_insert":    "#d8dee9",
     "editor_select_bg": "#434c5e",
     "editor_select_fg": "#eceff4",
-    "line_number_bg":   "#2e3440",
+    "line_number_bg":   "#3f444f",
     "line_number_fg":   "#4c566a",
     "indent_guide":     "#3b4252",
 
@@ -291,7 +303,7 @@ SOLARIZED_DARK_THEME = {
     "editor_insert":    "#93a1a1",
     "editor_select_bg": "#1c4b57",
     "editor_select_fg": "#eee8d5",
-    "line_number_bg":   "#002b36",
+    "line_number_bg":   "#143c46",
     "line_number_fg":   "#586e75",
     "indent_guide":     "#073642",
 
@@ -340,7 +352,7 @@ ONE_DARK_THEME = {
     "editor_insert":    "#abb2bf",
     "editor_select_bg": "#3e4451",
     "editor_select_fg": "#ffffff",
-    "line_number_bg":   "#282c34",
+    "line_number_bg":   "#393d44",
     "line_number_fg":   "#495162",
     "indent_guide":     "#3b4048",
 
@@ -389,7 +401,7 @@ GITHUB_LIGHT_THEME = {
     "editor_insert":    "#24292e",
     "editor_select_bg": "#c8e1ff",
     "editor_select_fg": "#24292e",
-    "line_number_bg":   "#ffffff",
+    "line_number_bg":   "#ebebeb",
     "line_number_fg":   "#8c959f",
     "indent_guide":     "#eaecef",
 
@@ -420,6 +432,14 @@ GITHUB_LIGHT_THEME = {
     "syntax_comment":    "#6a737d",
     "syntax_number":     "#005cc5",
     "syntax_function":   "#6f42c1",
+
+    # Minimap code-shape rectangles - lightened the same way as LIGHT_THEME
+    # above, for the same reason: this is also a white-background theme, so
+    # the full-strength syntax colors read as solid slabs once scaled up
+    # into minimap rows instead of a faint "shape of the code" preview.
+    "minimap_keyword":   "#f4c8cc",
+    "minimap_comment":   "#bcc0c4",
+    "minimap_default":   "#d6d6d6",
 }
 
 
@@ -442,7 +462,7 @@ CRT_THEME = {
     "editor_insert":    "#66ff66",
     "editor_select_bg": "#1f4d1f",
     "editor_select_fg": "#ccffcc",
-    "line_number_bg":   "#0a0f0a",
+    "line_number_bg":   "#1e221e",
     "line_number_fg":   "#1f6b1f",
     "indent_guide":     "#173317",
 
@@ -625,6 +645,30 @@ def save_recent_files(paths):
     it's given."""
     data = _load_settings()
     data["recent_files"] = list(paths)[:MAX_RECENT_FILES]
+    _save_settings(data)
+
+
+MAX_RECENT_FOLDERS = 10
+
+
+def load_recent_folders():
+    """Return the recently-opened project folders, most-recent first.
+    Missing/corrupt data just comes back as an empty list. Kept as its own
+    settings key (and its own MAX) rather than folded into recent_files -
+    a folder isn't a file and the two lists are surfaced separately (Open
+    Recent vs Open Recent Folder, and the Start Page's two columns)."""
+    folders = _load_settings().get("recent_folders")
+    if not isinstance(folders, list):
+        return []
+    return [f for f in folders if isinstance(f, str)][:MAX_RECENT_FOLDERS]
+
+
+def save_recent_folders(paths):
+    """Persist the recent-folders list. Callers are expected to have
+    already de-duped and capped it to MAX_RECENT_FOLDERS - this just
+    writes whatever it's given."""
+    data = _load_settings()
+    data["recent_folders"] = list(paths)[:MAX_RECENT_FOLDERS]
     _save_settings(data)
 
 

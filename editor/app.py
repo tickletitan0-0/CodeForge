@@ -21,6 +21,8 @@ import shlex
 import time
 import pathlib
 import webbrowser
+import traceback
+import weakref
 
 try:
     # app.py is being imported as part of the "editor" package (e.g. main.py
@@ -35,6 +37,7 @@ try:
         DEFAULT_FONT_FAMILY, FONT_FAMILY_CHOICES,
         is_dark_theme, blend_hex,
         load_recent_files, save_recent_files, MAX_RECENT_FILES,
+        load_recent_folders, save_recent_folders, MAX_RECENT_FOLDERS,
         load_stats, save_stats
     )
 except ImportError:
@@ -50,6 +53,7 @@ except ImportError:
         DEFAULT_FONT_FAMILY, FONT_FAMILY_CHOICES,
         is_dark_theme, blend_hex,
         load_recent_files, save_recent_files, MAX_RECENT_FILES,
+        load_recent_folders, save_recent_folders, MAX_RECENT_FOLDERS,
         load_stats, save_stats
     )
 
@@ -88,6 +92,38 @@ except ImportError:
     # above.
     import linters
 
+try:
+    # fun_effects.py is being imported as part of the "editor" package.
+    from . import fun_effects
+except ImportError:
+    # Standalone script - plain import, same fallback pattern as themes
+    # above.
+    import fun_effects
+
+try:
+    # code_folding.py is being imported as part of the "editor" package.
+    from . import code_folding
+except ImportError:
+    # Standalone script - plain import, same fallback pattern as themes
+    # above.
+    import code_folding
+
+try:
+    # goto.py is being imported as part of the "editor" package.
+    from . import goto
+except ImportError:
+    # Standalone script - plain import, same fallback pattern as themes
+    # above.
+    import goto
+
+try:
+    # plugins.py is being imported as part of the "editor" package.
+    from . import plugins
+except ImportError:
+    # Standalone script - plain import, same fallback pattern as themes
+    # above.
+    import plugins
+
 
 def resource_path(filename):
     """Path to a bundled non-Python file (currently just icon.png), that
@@ -108,7 +144,130 @@ def resource_path(filename):
 # the user last picked (defaulting to light) so the whole app reads as one
 # consistent theme.
 THEME_NAME = load_theme_preference()
-THEME = THEMES[THEME_NAME]
+# A *copy* of THEMES[THEME_NAME], never the same dict object - _apply_theme_live
+# below does THEME.clear() + THEME.update(new_theme) to re-theme live, and if
+# THEME were an alias of a THEMES[...] entry (as a plain `= THEMES[THEME_NAME]`
+# would be), that clear() would corrupt THEMES' own copy of that palette. Once
+# corrupted, switching back to that theme name later hands _apply_theme_live a
+# `new_theme` that's literally the same (just-cleared) object as THEME itself,
+# leaving both empty - which is exactly what caused the KeyError: 'app_bg'
+# crash.
+
+
+class _ThemeColor(str):
+    """A color string that also remembers which THEME key produced it.
+
+    Every palette in themes.py deliberately reuses the same hex value for
+    several different keys (e.g. DARK_THEME's app_bg/editor_bg/output_bg
+    are all "#1e1e1e"; LIGHT_THEME's app_bg and sidebar_bg are both
+    "#f3f3f3"). That's harmless for widgets built fresh from THEME[key],
+    but it used to break live re-theming (_apply_theme_live), which
+    figured out each widget's new color by looking up its *current
+    literal color* in a value->value remap - and when several keys
+    shared that literal value, only one of them could win the lookup, so
+    every widget actually keyed by one of the others silently got
+    recolored from the wrong key instead (permanently, since the
+    mis-colored widget doesn't visibly match the key it's supposed to be
+    tracking, that widget just quietly drifts further every theme
+    switch after that).
+
+    Wrapping THEME's values in this subclass and reading `.theme_key`
+    off of whatever gets passed into a widget's color options (see
+    _install_theme_key_tracking below) lets the retheme code skip that
+    guesswork entirely and just re-read THEME[key] directly.
+    """
+    __slots__ = ("theme_key",)
+
+    def __new__(cls, value, key):
+        obj = str.__new__(cls, value)
+        obj.theme_key = key
+        return obj
+
+
+class _TrackedTheme(dict):
+    """Drop-in replacement for a plain palette dict: behaves exactly like
+    one everywhere (THEME.clear()/.update()/dict(THEME)/THEME.items() all
+    still see and store plain strings, unchanged from before), except
+    THEME["some_key"] hands back an _ThemeColor instead of a bare str, so
+    that value carries its own key wherever it flows into a widget option.
+    """
+
+    def __getitem__(self, key):
+        return _ThemeColor(dict.__getitem__(self, key), key)
+
+    def get(self, key, default=None):
+        if key in self:
+            return self[key]
+        return default
+
+
+# THEME's values are wrapped in _ThemeColor (via _TrackedTheme) rather
+# than plain str, so that live re-theming can track *which key* colored a
+# given widget option, instead of re-deriving it from the literal color
+# text - see _ThemeColor's docstring above for why that distinction turns
+# out to matter.
+THEME = _TrackedTheme(THEMES[THEME_NAME])
+
+# Every widget's color options, keyed by THEME key rather than by literal
+# color: {widget: {"bg": "output_bg", "fg": "muted_fg", ...}}. Populated
+# automatically (see _install_theme_key_tracking) the moment any widget
+# is constructed or configured with a value that came from THEME[...] -
+# no call site anywhere else in the app needs to change. A
+# WeakKeyDictionary so a closed tab's widgets don't linger here forever.
+_widget_theme_keys = weakref.WeakKeyDictionary()
+
+
+def _install_theme_key_tracking():
+    """Hooks widget construction and .configure()/.config() so that any
+    _ThemeColor passed as bg/fg/etc gets recorded into _widget_theme_keys
+    before it's handed off to Tk - which only ever sees/stores a plain
+    color string from that point on (Tk has no idea what an _ThemeColor
+    is, and doesn't need to). No widget-creation call site anywhere in
+    the app, git_panel.py, or music_player.py needs to change for
+    tracking to work.
+
+    Deliberately does NOT hook tkinter's shared low-level _options()
+    helper, even though that would catch both these paths in one patch -
+    Text.tag_configure(), Canvas.itemconfigure(), Menu.entryconfigure(),
+    etc. all also funnel through that same helper on that same widget
+    object, so a first attempt at this patched _options() directly and
+    ended up recording e.g. a Text tag's search_current_bg color as if
+    it were the Text *widget's* own bg/fg - which is exactly what made
+    the editor start turning orange (search_current_bg's color) instead
+    of tracking editor_bg. Hooking the widget-level entry points instead
+    keeps tag/item/menu-entry coloring out of this table entirely - it
+    was never meant to be covered by it, and doesn't need to be, since
+    _apply_theme_live already re-runs the actual tag setup functions
+    directly against the new THEME.
+    """
+    original_widget_init = tk.BaseWidget.__init__
+    original_configure = tk.Misc.configure
+
+    def _record(self, *sources):
+        for source in sources:
+            if not source:
+                continue
+            for opt, val in source.items():
+                key = getattr(val, "theme_key", None)
+                if key is None:
+                    continue
+                opt_name = opt[:-1] if opt.endswith("_") else opt
+                _widget_theme_keys.setdefault(self, {})[opt_name] = key
+
+    def _tracking_init(self, master=None, widgetName=None, cnf={}, kw={}, extra=()):
+        _record(self, cnf, kw)
+        original_widget_init(self, master, widgetName, cnf, kw, extra)
+
+    def _tracking_configure(self, cnf=None, **kw):
+        _record(self, cnf, kw)
+        return original_configure(self, cnf, **kw)
+
+    tk.BaseWidget.__init__ = _tracking_init
+    tk.Misc.configure = _tracking_configure
+    tk.Misc.config = _tracking_configure
+
+
+_install_theme_key_tracking()
 
 
 def _scanline_bg():
@@ -188,27 +347,22 @@ _COMMENT_RE = re.compile(r'#.*')
 _NUMBER_RE = re.compile(r'\b\d+\.?\d*\b')
 _FUNCTION_RE = re.compile(r'\b([a-zA-Z_]\w*)\s*(?=\()')
 
-# ---- C-like languages (C, C++, Java, JavaScript/JSX, TypeScript/TSX) ----
+# ---- C-like languages (Java, JavaScript) ----
 _C_LIKE_KEYWORDS = {
-    # C / C++
-    "auto", "break", "case", "char", "const", "continue", "default", "do",
-    "double", "else", "enum", "extern", "float", "for", "goto", "if",
-    "inline", "int", "long", "register", "restrict", "return", "short",
-    "signed", "sizeof", "static", "struct", "switch", "typedef", "union",
-    "unsigned", "void", "volatile", "while", "class", "namespace",
-    "template", "typename", "public", "private", "protected", "virtual",
-    "override", "friend", "operator", "using", "try", "catch", "throw",
-    "nullptr", "bool",
+    # Shared / control flow
+    "break", "case", "const", "continue", "default", "do", "else", "enum",
+    "for", "if", "int", "long", "return", "short", "static", "switch",
+    "void", "while", "class", "public", "private", "protected", "virtual",
+    "override", "try", "catch", "throw",
     # Java
     "package", "import", "interface", "implements", "extends", "final",
     "abstract", "synchronized", "native", "transient", "throws",
-    "instanceof", "super", "boolean", "byte",
-    # JavaScript / TypeScript
-    "function", "var", "let", "const", "export", "default", "from", "as",
+    "instanceof", "super", "boolean", "byte", "char", "double", "float",
+    "volatile",
+    # JavaScript
+    "function", "var", "let", "export", "from", "as",
     "async", "await", "yield", "of", "in", "typeof", "delete", "new",
-    "this", "null", "undefined", "true", "false", "void", "type",
-    "declare", "readonly", "enum", "keyof", "infer", "module", "get", "set",
-    "static",
+    "this", "null", "undefined", "true", "false", "get", "set",
 }
 _C_LIKE_KEYWORD_RE = re.compile(r'\b(' + '|'.join(sorted(_C_LIKE_KEYWORDS)) + r')\b')
 _C_LIKE_STRING_RE = re.compile(
@@ -217,7 +371,7 @@ _C_LIKE_STRING_RE = re.compile(
 _C_LIKE_COMMENT_RE = re.compile(r'//.*|/\*[\s\S]*?\*/')
 _C_LIKE_NUMBER_RE = re.compile(r'\b0[xX][0-9a-fA-F]+\b|\b\d+\.?\d*[fFlLuU]?\b')
 
-# ---- HTML / XML ----
+# ---- HTML ----
 _HTML_TAG_RE = re.compile(r'</?[a-zA-Z][\w-]*')
 _HTML_STRING_RE = re.compile(r'"[^"]*"|\'[^\']*\'')
 _HTML_COMMENT_RE = re.compile(r'<!--[\s\S]*?-->')
@@ -234,54 +388,6 @@ _CSS_COMMENT_RE = re.compile(r'/\*[\s\S]*?\*/')
 _CSS_NUMBER_RE = re.compile(
     r'\b\d+\.?\d*(px|em|rem|%|vh|vw|vmin|vmax|s|ms|deg|fr)?\b'
 )
-
-# ---- JSON ----
-_JSON_KEYWORD_RE = re.compile(r'\b(true|false|null)\b')
-_JSON_KEY_RE = re.compile(r'"(?:\\.|[^"\\])*"(?=\s*:)')
-_JSON_STRING_RE = re.compile(r'"(?:\\.|[^"\\])*"')
-_JSON_NUMBER_RE = re.compile(r'-?\b\d+\.?\d*([eE][+-]?\d+)?\b')
-
-# ---- YAML ----
-_YAML_COMMENT_RE = re.compile(r'#.*')
-_YAML_KEY_RE = re.compile(r'^\s*[\w.-]+(?=\s*:)', re.MULTILINE)
-_YAML_STRING_RE = re.compile(r'"[^"]*"|\'[^\']*\'')
-_YAML_NUMBER_RE = re.compile(r'\b\d+\.?\d*\b')
-
-# ---- SQL ----
-_SQL_KEYWORDS = {
-    "select", "insert", "update", "delete", "from", "where", "join",
-    "inner", "outer", "left", "right", "full", "on", "group", "by",
-    "order", "having", "values", "into", "create", "table", "alter",
-    "drop", "index", "primary", "key", "foreign", "references", "not",
-    "null", "default", "and", "or", "as", "distinct", "limit", "offset",
-    "union", "all", "exists", "in", "between", "like", "is", "case",
-    "when", "then", "else", "end", "set", "view", "trigger", "cascade",
-}
-_SQL_KEYWORD_RE = re.compile(
-    r'\b(' + '|'.join(sorted(_SQL_KEYWORDS)) + r')\b', re.IGNORECASE
-)
-_SQL_STRING_RE = re.compile(r"'(?:''|[^'])*'")
-_SQL_COMMENT_RE = re.compile(r'--.*|/\*[\s\S]*?\*/')
-_SQL_NUMBER_RE = re.compile(r'\b\d+\.?\d*\b')
-
-# ---- Shell ----
-_SHELL_KEYWORDS = {
-    "if", "then", "else", "elif", "fi", "for", "while", "do", "done",
-    "case", "esac", "function", "return", "export", "local", "readonly",
-    "shift", "break", "continue", "in", "select", "until", "time", "echo",
-}
-_SHELL_KEYWORD_RE = re.compile(r'\b(' + '|'.join(sorted(_SHELL_KEYWORDS)) + r')\b')
-_SHELL_STRING_RE = re.compile(r'"(?:\\.|[^"\\])*"|\'[^\']*\'')
-_SHELL_COMMENT_RE = re.compile(r'#.*')
-_SHELL_NUMBER_RE = re.compile(r'\b\d+\.?\d*\b')
-
-# ---- Markdown ----
-_MD_HEADER_RE = re.compile(r'^#{1,6}\s.*$', re.MULTILINE)
-_MD_EMPHASIS_RE = re.compile(
-    r'\*\*[^*]+\*\*|\*[^*]+\*|__[^_]+__|_[^_]+_'
-)
-_MD_CODE_RE = re.compile(r'```[\s\S]*?```|`[^`]+`')
-_MD_LINK_RE = re.compile(r'\[[^\]]*\]\([^)]*\)')
 
 # Each profile maps a highlight tag name to a list of patterns to apply for
 # that tag. A list entry is either a compiled regex (the whole match is
@@ -317,56 +423,15 @@ _LANGUAGE_PROFILES = {
         "number": [_CSS_NUMBER_RE],
         "function": [],
     },
-    "json": {
-        "comment": [],
-        "string": [_JSON_STRING_RE],
-        "keyword": [_JSON_KEYWORD_RE],
-        "number": [_JSON_NUMBER_RE],
-        "function": [_JSON_KEY_RE],
-    },
-    "yaml": {
-        "comment": [_YAML_COMMENT_RE],
-        "string": [_YAML_STRING_RE],
-        "keyword": [],
-        "number": [_YAML_NUMBER_RE],
-        "function": [_YAML_KEY_RE],
-    },
-    "sql": {
-        "comment": [_SQL_COMMENT_RE],
-        "string": [_SQL_STRING_RE],
-        "keyword": [_SQL_KEYWORD_RE],
-        "number": [_SQL_NUMBER_RE],
-        "function": [(_FUNCTION_RE, 1)],
-    },
-    "shell": {
-        "comment": [_SHELL_COMMENT_RE],
-        "string": [_SHELL_STRING_RE],
-        "keyword": [_SHELL_KEYWORD_RE],
-        "number": [_SHELL_NUMBER_RE],
-        "function": [(_FUNCTION_RE, 1)],
-    },
-    "markdown": {
-        "comment": [_MD_CODE_RE],
-        "string": [_MD_EMPHASIS_RE],
-        "keyword": [_MD_HEADER_RE],
-        "number": [],
-        "function": [_MD_LINK_RE],
-    },
     "plaintext": {},
 }
 
 _EXT_TO_SYNTAX_PROFILE = {
     ".py": "python", ".pyw": "python",
-    ".js": "c_like", ".jsx": "c_like", ".ts": "c_like", ".tsx": "c_like",
-    ".c": "c_like", ".h": "c_like", ".cpp": "c_like", ".hpp": "c_like",
+    ".js": "c_like",
     ".java": "c_like",
-    ".html": "html", ".htm": "html", ".xml": "html",
+    ".html": "html", ".htm": "html",
     ".css": "css",
-    ".json": "json",
-    ".yml": "yaml", ".yaml": "yaml",
-    ".sql": "sql",
-    ".sh": "shell",
-    ".md": "markdown",
 }
 
 
@@ -560,6 +625,166 @@ def _maximize_window(root):
     root.geometry(f"{root.winfo_screenwidth()}x{root.winfo_screenheight()}+0+0")
 
 
+def _build_color_remap(old_theme, new_theme):
+    """Maps every literal color value in `old_theme` to whatever the
+    corresponding key holds in `new_theme` - e.g. old editor_bg's hex ->
+    new editor_bg's hex. This is now only a *fallback* for widgets
+    _remap_widget_colors couldn't identify a THEME key for (see there) -
+    the palettes routinely reuse the same hex for several different keys
+    (DARK_THEME's app_bg/editor_bg/output_bg are all "#1e1e1e", for
+    instance), so two different keys can easily share the same old color
+    here, and only one of them can win a plain value->value lookup. That
+    ambiguity used to be the *only* mechanism re-theming had, which is
+    what caused colors to silently drift to the wrong key's value on
+    every switch; now it's a rare fallback rather than the main path, so
+    the ambiguity mostly just doesn't come up in practice.
+    """
+    remap = {}
+    for key, old_val in old_theme.items():
+        new_val = new_theme.get(key)
+        if new_val is None or new_val == old_val:
+            continue
+        remap.setdefault(old_val, new_val)
+    return remap
+
+
+# Every widget option name (across plain tk widgets - ttk widgets are
+# themed through ttk.Style instead, and don't respond to these) that ever
+# holds one of THEME's literal color values anywhere in this app. bg/
+# background and fg/foreground are true Tk aliases for the same
+# underlying option (not two independent ones), so they're grouped here
+# rather than listed separately - see _remap_widget_colors for why that
+# distinction matters.
+_THEMEABLE_COLOR_OPTION_GROUPS = (
+    ("bg", "background"),
+    ("fg", "foreground"),
+    ("highlightbackground",),
+    ("highlightcolor",),
+    ("insertbackground",),
+    ("selectbackground",),
+    ("selectforeground",),
+    ("activebackground",),
+    ("activeforeground",),
+    ("disabledforeground",),
+    ("readonlybackground",),
+    ("troughcolor",),
+)
+
+
+def _remap_widget_colors(widget, remap):
+    """Recursively walks `widget` and every descendant, updating any
+    color option that was ever set from THEME. For each option, this
+    tries two things in order:
+
+      1. Key-based (exact): if _widget_theme_keys recorded which THEME
+         key colored this option (see _install_theme_key_tracking), just
+         re-read THEME[key] directly. Immune to the "two keys share the
+         same hex" collisions the old value-based approach couldn't
+         resolve - this is the actual fix for colors drifting/becoming
+         inconsistent across repeated theme switches.
+      2. Literal-value fallback: for anything not built while tracking
+         was active (in practice this shouldn't happen for this app's
+         own widgets, since tracking is installed before any UI is
+         built, but it's a safe net for e.g. third-party widget code),
+         fall back to the old best-effort remap-by-current-color.
+
+    bg/background and fg/foreground are resolved once per group rather
+    than as independent options: a widget built with `bg=THEME["x"]` is
+    only ever tracked under the name "bg", so treating "background" as a
+    separate option would miss the tracked key, fall back to the
+    collision-prone value guess for it instead, and then silently
+    clobber the correct "bg" update with a wrong "background" one when
+    both land in the same final configure() call (they're the same
+    underlying Tk option, so whichever gets applied last wins).
+
+    Safe to call on anything - ttk widgets and any option a given widget
+    class doesn't support both just raise TclError, which is caught and
+    skipped rather than needing a widget-type allowlist."""
+    try:
+        supported = widget.configure()
+    except tk.TclError:
+        supported = None
+
+    if supported:
+        updates = {}
+        tracked = _widget_theme_keys.get(widget)
+        for group in _THEMEABLE_COLOR_OPTION_GROUPS:
+            present = [o for o in group if o in supported]
+            if not present:
+                continue
+
+            tracked_key = None
+            if tracked:
+                for alias in group:
+                    if alias in tracked:
+                        tracked_key = tracked[alias]
+                        break
+
+            opt = present[0]
+            if tracked_key is not None and tracked_key in THEME:
+                new_value = THEME[tracked_key]
+                try:
+                    current_value = str(widget.cget(opt))
+                except tk.TclError:
+                    current_value = None
+                if current_value != new_value:
+                    updates[opt] = new_value
+                continue
+
+            try:
+                current_value = widget.cget(opt)
+            except tk.TclError:
+                continue
+            # Tkinter sometimes hands back a _tkinter.Tcl_Obj instead of a
+            # plain str for a given widget/option combo (e.g. some ttk-
+            # adjacent widgets, or platform-specific color reprs) - and
+            # that Tcl_Obj isn't guaranteed hashable, which made this dict
+            # lookup itself raise ("unhashable type: '_tkinter.Tcl_Obj'")
+            # rather than just failing to match anything. THEME's own
+            # values (and therefore remap's keys) are always plain str,
+            # so coercing here is exactly what's needed to compare like
+            # with like - and str() is always hashable, unlike Tcl_Obj.
+            try:
+                current_value = str(current_value)
+            except Exception:
+                continue
+            new_value = remap.get(current_value)
+            if new_value is not None:
+                updates[opt] = new_value
+        if updates:
+            try:
+                widget.configure(**updates)
+            except tk.TclError:
+                pass
+
+    try:
+        children = widget.winfo_children()
+    except tk.TclError:
+        return
+    for child in children:
+        _remap_widget_colors(child, remap)
+
+
+# Rendered as the Start Page's title in place of a plain "CodeForge" label -
+# a monospace figlet-style banner, drawn with Courier New at a small enough
+# size that its fixed-width alignment survives (see _populate_start_page).
+_STARTUP_BANNER = r"""
+      _____           _____         _____        ______         _____         _____         _____         _____         ______   
+  ___|\    \     ____|\    \    ___|\    \   ___|\     \   ____|\    \   ____|\    \    ___|\    \    ___|\    \    ___|\     \  
+ /    /\    \   /     /\    \  |    |\    \ |     \     \ |    | \    \ /     /\    \  |    |\    \  /    /\    \  |     \     \ 
+|    |  |    | /     /  \    \ |    | |    ||     ,_____/||    |______//     /  \    \ |    | |    ||    |  |____| |     ,_____/|
+|    |  |____||     |    |    ||    | |    ||     \--'\_|/|    |----'\|     |    |    ||    |/____/ |    |    ____ |     \--'\_|/
+|    |   ____ |     |    |    ||    | |    ||     /___/|  |    |_____/|     |    |    ||    |\    \ |    |   |    ||     /___/|  
+|    |  |    ||\     \  /    /||    | |    ||     \____|\ |    |      |\     \  /    /||    | |    ||    |   |_,  ||     \____|\ 
+|\ ___\/    /|| \_____\/____/ ||____|/____/||____ '     /||____|      | \_____\/____/ ||____| |____||\ ___\___/  /||____ '     /|
+| |   /____/ | \ |    ||    | /|    /    | ||    /_____/ ||    |       \ |    ||    | /|    | |    || |   /____ / ||    /_____/ |
+ \|___|    | /  \|____||____|/ |____|____|/ |____|     | /|____|        \|____||____|/ |____| |____| \|___|    | / |____|     | /
+   \( |____|/      \(    )/      \(    )/     \( |_____|/   )/             \(    )/      \(     )/     \( |____|/    \( |_____|/ 
+    '   )/          '    '        '    '       '    )/      '               '    '        '     '       '   )/        '    )/    
+        '                                           '                                                       '              '
+"""
+
+
 def run():
     _apply_windows_dpi_awareness()
 
@@ -591,172 +816,198 @@ def run():
     except tk.TclError:
         pass
 
-    style.configure(
-        "Treeview",
-        background=THEME["sidebar_bg"],
-        fieldbackground=THEME["sidebar_bg"],
-        foreground=THEME["editor_fg"],
-        borderwidth=0,
-        bordercolor=THEME["sidebar_bg"],
-        lightcolor=THEME["sidebar_bg"],
-        darkcolor=THEME["sidebar_bg"]
-    )
-    style.map(
-        "Treeview",
-        background=[("selected", THEME["editor_select_bg"])],
-        foreground=[("selected", THEME["editor_select_fg"])]
-    )
-
-    style.configure(
-        "TNotebook",
-        background=THEME["app_bg"],
-        borderwidth=0,
-        bordercolor=THEME["border"],
-        # clam draws a light/dark bevel around the notebook and its tabs by
-        # default; without pinning these too (same fix as the scrollbars
-        # below), that bevel shows up as a stray white edge around every
-        # tab strip in dark mode.
-        lightcolor=THEME["app_bg"],
-        darkcolor=THEME["app_bg"]
-    )
-    style.configure(
-        "TNotebook.Tab",
-        background=THEME["panel_header_bg"],
-        foreground=THEME["panel_header_fg"],
-        padding=(10, 4),
-        borderwidth=0,
-        bordercolor=THEME["border"],
-        lightcolor=THEME["panel_header_bg"],
-        darkcolor=THEME["panel_header_bg"]
-    )
-    style.map(
-        "TNotebook.Tab",
-        background=[("selected", THEME["editor_bg"])],
-        foreground=[("selected", THEME["editor_fg"])],
-        lightcolor=[("selected", THEME["editor_bg"])],
-        darkcolor=[("selected", THEME["editor_bg"])]
-    )
-
-    # Used by the Settings dialog's font/theme dropdowns.
-    style.configure(
-        "Settings.TCombobox",
-        fieldbackground=THEME["popup_bg"],
-        background=THEME["panel_header_bg"],
-        foreground=THEME["popup_fg"],
-        arrowcolor=THEME["panel_header_fg"],
-        bordercolor=THEME["border"],
-        lightcolor=THEME["popup_bg"],
-        darkcolor=THEME["popup_bg"],
-        selectbackground=THEME["popup_bg"],
-        selectforeground=THEME["popup_fg"],
-        insertcolor=THEME["editor_insert"],
-        padding=4,
-    )
-    style.map(
-        "Settings.TCombobox",
-        fieldbackground=[("readonly", THEME["popup_bg"])],
-        foreground=[("readonly", THEME["popup_fg"])],
-        selectbackground=[("readonly", THEME["popup_bg"])],
-        selectforeground=[("readonly", THEME["popup_fg"])],
-    )
-    root.option_add("*TCombobox*Listbox.background", THEME["popup_bg"])
-    root.option_add("*TCombobox*Listbox.foreground", THEME["popup_fg"])
-    root.option_add("*TCombobox*Listbox.selectBackground", THEME["popup_select_bg"])
-    root.option_add("*TCombobox*Listbox.selectForeground", THEME["popup_select_fg"])
-
-    # Editor tabs get their own style (rather than restyling "TNotebook.Tab"
-    # globally) so the little close "x" only shows up on file tabs - the
-    # Output/Terminal/Music tabs on bottom_panel keep the plain look, since
-    # those aren't closable.
-    #
-    # tk.PhotoImage has no real alpha blending, but a freshly created one is
-    # fully transparent until pixels are explicitly set - so drawing just the
-    # X's diagonals and leaving everything else untouched gives a clean
-    # icon that sits correctly on top of both selected and unselected tab
-    # colors, in every theme, without needing a background color at all.
-    def _make_close_icon(color, size=12):
-        img = tk.PhotoImage(width=size, height=size)
-        inset = 3
-        for i in range(inset, size - inset):
-            img.put(color, (i, i))
-            img.put(color, (i, i + 1))
-            img.put(color, (size - 1 - i, i))
-            img.put(color, (size - 1 - i, i + 1))
-        return img
-
-    # Referenced by the style's element images - kept alive on the style
-    # object itself since ttk holds the images by name only. Losing the
-    # last live Python reference to a PhotoImage lets Tk garbage-collect
-    # its pixel data even though the name is still registered.
-    style._close_tab_icons = (
-        _make_close_icon(THEME["muted_fg"]),
-        _make_close_icon(THEME["panel_header_fg"]),
-        _make_close_icon(THEME["panel_header_fg"]),
-    )
-    icon_normal, icon_active, icon_pressed = style._close_tab_icons
-
-    style.element_create(
-        "EditorTab.close", "image", icon_normal,
-        ("pressed", icon_pressed), ("active", icon_active),
-        border=6, sticky=""
-    )
-    style.layout(
-        "EditorTabs.TNotebook.Tab",
-        [("TNotebook.tab", {"sticky": "nswe", "children": [
-            ("TNotebook.padding", {"side": "top", "sticky": "nswe", "children": [
-                ("TNotebook.focus", {"side": "top", "sticky": "nswe", "children": [
-                    ("TNotebook.label", {"side": "left", "sticky": ""}),
-                    ("EditorTab.close", {"side": "right", "sticky": ""}),
-                ]}),
-            ]}),
-        ]})]
-    )
-    style.configure(
-        "EditorTabs.TNotebook",
-        background=THEME["app_bg"],
-        borderwidth=0,
-        bordercolor=THEME["border"],
-        lightcolor=THEME["app_bg"],
-        darkcolor=THEME["app_bg"]
-    )
-    style.configure(
-        "EditorTabs.TNotebook.Tab",
-        background=THEME["panel_header_bg"],
-        foreground=THEME["panel_header_fg"],
-        padding=(10, 4, 6, 4),
-        borderwidth=0,
-        bordercolor=THEME["border"],
-        lightcolor=THEME["panel_header_bg"],
-        darkcolor=THEME["panel_header_bg"]
-    )
-    style.map(
-        "EditorTabs.TNotebook.Tab",
-        background=[("selected", THEME["editor_bg"])],
-        foreground=[("selected", THEME["editor_fg"])],
-        lightcolor=[("selected", THEME["editor_bg"])],
-        darkcolor=[("selected", THEME["editor_bg"])]
-    )
-
-    for orientation in ("Vertical", "Horizontal"):
+    def _apply_ttk_styles():
+        """(Re-)applies every ttk.Style rule this app uses, reading
+        current THEME values. Split out from initial setup so a live
+        theme switch can just call this again instead of duplicating the
+        whole block - ttk widgets take their colors from named styles
+        rather than per-instance options, so they need this rather than
+        the plain-widget value-remap _remap_widget_colors does."""
         style.configure(
-            f"{orientation}.TScrollbar",
-            background=THEME["panel_header_bg"],
-            troughcolor=THEME["app_bg"],
-            bordercolor=THEME["border"],
-            arrowcolor=THEME["panel_header_fg"],
-            # clam draws a light/dark bevel around the trough and thumb by
-            # default; without pinning these too, that bevel shows up as a
-            # stray light edge around every scrollbar in dark mode.
-            lightcolor=THEME["panel_header_bg"],
-            darkcolor=THEME["panel_header_bg"],
-            relief="flat"
+            "Treeview",
+            background=THEME["sidebar_bg"],
+            fieldbackground=THEME["sidebar_bg"],
+            foreground=THEME["editor_fg"],
+            borderwidth=0,
+            bordercolor=THEME["sidebar_bg"],
+            lightcolor=THEME["sidebar_bg"],
+            darkcolor=THEME["sidebar_bg"]
         )
         style.map(
-            f"{orientation}.TScrollbar",
-            background=[("active", THEME["border"])],
-            lightcolor=[("active", THEME["border"])],
-            darkcolor=[("active", THEME["border"])]
+            "Treeview",
+            background=[("selected", THEME["editor_select_bg"])],
+            foreground=[("selected", THEME["editor_select_fg"])]
         )
+
+        style.configure(
+            "TNotebook",
+            background=THEME["app_bg"],
+            borderwidth=0,
+            bordercolor=THEME["border"],
+            # clam draws a light/dark bevel around the notebook and its tabs by
+            # default; without pinning these too (same fix as the scrollbars
+            # below), that bevel shows up as a stray white edge around every
+            # tab strip in dark mode.
+            lightcolor=THEME["app_bg"],
+            darkcolor=THEME["app_bg"]
+        )
+        style.configure(
+            "TNotebook.Tab",
+            background=THEME["panel_header_bg"],
+            foreground=THEME["panel_header_fg"],
+            padding=(10, 4),
+            borderwidth=0,
+            bordercolor=THEME["border"],
+            lightcolor=THEME["panel_header_bg"],
+            darkcolor=THEME["panel_header_bg"]
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", THEME["editor_bg"])],
+            foreground=[("selected", THEME["editor_fg"])],
+            lightcolor=[("selected", THEME["editor_bg"])],
+            darkcolor=[("selected", THEME["editor_bg"])]
+        )
+
+        # Used by the Settings dialog's font/theme dropdowns.
+        style.configure(
+            "Settings.TCombobox",
+            fieldbackground=THEME["popup_bg"],
+            background=THEME["panel_header_bg"],
+            foreground=THEME["popup_fg"],
+            arrowcolor=THEME["panel_header_fg"],
+            bordercolor=THEME["border"],
+            lightcolor=THEME["popup_bg"],
+            darkcolor=THEME["popup_bg"],
+            selectbackground=THEME["popup_bg"],
+            selectforeground=THEME["popup_fg"],
+            insertcolor=THEME["editor_insert"],
+            padding=4,
+        )
+        style.map(
+            "Settings.TCombobox",
+            fieldbackground=[("readonly", THEME["popup_bg"])],
+            foreground=[("readonly", THEME["popup_fg"])],
+            selectbackground=[("readonly", THEME["popup_bg"])],
+            selectforeground=[("readonly", THEME["popup_fg"])],
+        )
+        root.option_add("*TCombobox*Listbox.background", THEME["popup_bg"])
+        root.option_add("*TCombobox*Listbox.foreground", THEME["popup_fg"])
+        root.option_add("*TCombobox*Listbox.selectBackground", THEME["popup_select_bg"])
+        root.option_add("*TCombobox*Listbox.selectForeground", THEME["popup_select_fg"])
+
+        # Editor tabs get their own style (rather than restyling "TNotebook.Tab"
+        # globally) so the little close "x" only shows up on file tabs - the
+        # Output/Terminal/Music tabs on bottom_panel keep the plain look, since
+        # those aren't closable.
+        #
+        # tk.PhotoImage has no real alpha blending, but a freshly created one is
+        # fully transparent until pixels are explicitly set - so drawing just the
+        # X's diagonals and leaving everything else untouched gives a clean
+        # icon that sits correctly on top of both selected and unselected tab
+        # colors, in every theme, without needing a background color at all.
+        #
+        # The three PhotoImage objects are created exactly once and kept
+        # alive on the style object (ttk holds element images by name only,
+        # so losing the last Python reference lets Tk garbage-collect the
+        # pixel data even though the name is still registered). A live
+        # theme switch redraws new colors onto these same objects rather
+        # than creating fresh ones - the ttk element bound "EditorTab.close"
+        # to these specific image names at creation time and doesn't support
+        # being pointed at different images later, but it *does* pick up
+        # new pixels drawn onto the image it's already showing.
+        def _draw_close_icon(img, color, size=12):
+            img.blank()
+            inset = 3
+            for i in range(inset, size - inset):
+                img.put(color, (i, i))
+                img.put(color, (i, i + 1))
+                img.put(color, (size - 1 - i, i))
+                img.put(color, (size - 1 - i, i + 1))
+
+        existing_icons = getattr(style, "_close_tab_icons", None)
+        if existing_icons is None:
+            icon_normal = tk.PhotoImage(width=12, height=12)
+            icon_active = tk.PhotoImage(width=12, height=12)
+            icon_pressed = tk.PhotoImage(width=12, height=12)
+            style._close_tab_icons = (icon_normal, icon_active, icon_pressed)
+        else:
+            icon_normal, icon_active, icon_pressed = existing_icons
+
+        _draw_close_icon(icon_normal, THEME["muted_fg"])
+        _draw_close_icon(icon_active, THEME["panel_header_fg"])
+        _draw_close_icon(icon_pressed, THEME["panel_header_fg"])
+
+        # element_create raises if an element of this name already exists
+        # (true on every call after the first, e.g. a live theme switch) -
+        # harmless to skip, since the element already points at the same
+        # image objects whose pixels were just redrawn above.
+        if "EditorTab.close" not in style.element_names():
+            style.element_create(
+                "EditorTab.close", "image", icon_normal,
+                ("pressed", icon_pressed), ("active", icon_active),
+                border=6, sticky=""
+            )
+
+        style.layout(
+            "EditorTabs.TNotebook.Tab",
+            [("TNotebook.tab", {"sticky": "nswe", "children": [
+                ("TNotebook.padding", {"side": "top", "sticky": "nswe", "children": [
+                    ("TNotebook.focus", {"side": "top", "sticky": "nswe", "children": [
+                        ("TNotebook.label", {"side": "left", "sticky": ""}),
+                        ("EditorTab.close", {"side": "right", "sticky": ""}),
+                    ]}),
+                ]}),
+            ]})]
+        )
+        style.configure(
+            "EditorTabs.TNotebook",
+            background=THEME["app_bg"],
+            borderwidth=0,
+            bordercolor=THEME["border"],
+            lightcolor=THEME["app_bg"],
+            darkcolor=THEME["app_bg"]
+        )
+        style.configure(
+            "EditorTabs.TNotebook.Tab",
+            background=THEME["panel_header_bg"],
+            foreground=THEME["panel_header_fg"],
+            padding=(10, 4, 6, 4),
+            borderwidth=0,
+            bordercolor=THEME["border"],
+            lightcolor=THEME["panel_header_bg"],
+            darkcolor=THEME["panel_header_bg"]
+        )
+        style.map(
+            "EditorTabs.TNotebook.Tab",
+            background=[("selected", THEME["editor_bg"])],
+            foreground=[("selected", THEME["editor_fg"])],
+            lightcolor=[("selected", THEME["editor_bg"])],
+            darkcolor=[("selected", THEME["editor_bg"])]
+        )
+
+        for orientation in ("Vertical", "Horizontal"):
+            style.configure(
+                f"{orientation}.TScrollbar",
+                background=THEME["panel_header_bg"],
+                troughcolor=THEME["app_bg"],
+                bordercolor=THEME["border"],
+                arrowcolor=THEME["panel_header_fg"],
+                # clam draws a light/dark bevel around the trough and thumb by
+                # default; without pinning these too, that bevel shows up as a
+                # stray light edge around every scrollbar in dark mode.
+                lightcolor=THEME["panel_header_bg"],
+                darkcolor=THEME["panel_header_bg"],
+                relief="flat"
+            )
+            style.map(
+                f"{orientation}.TScrollbar",
+                background=[("active", THEME["border"])],
+                lightcolor=[("active", THEME["border"])],
+                darkcolor=[("active", THEME["border"])]
+            )
+
+    _apply_ttk_styles()
 
     # tk.Menu doesn't inherit from THEME automatically, so every menu (the
     # top bar's dropdowns and the two right-click context menus) needs these
@@ -798,6 +1049,7 @@ def run():
     # popup/tk_popup/grab_release.
     class ThemedMenu:
         _open_stack = []  # every currently-open ThemedMenu, root first
+        _all_instances = []  # every ThemedMenu ever created, for live retheme
 
         def __init__(self, master, tearoff=0, **opts):
             self.master = master
@@ -806,6 +1058,20 @@ def run():
             self.toplevel = None
             self.row_widgets = []
             self._child = None
+            ThemedMenu._all_instances.append(self)
+
+        @classmethod
+        def retheme_all(cls, new_opts):
+            """Updates every ThemedMenu's own color options in place to
+            `new_opts` - each instance got its own copy of menu_opts via
+            **opts in __init__ rather than a shared reference, so a live
+            theme switch has to reach every instance individually rather
+            than just updating menu_opts itself. Safe to call while a menu
+            is open: popup() reads self.opts fresh each time it (re)draws
+            a menu, so an open menu just needs closing/reopening to show
+            the new colors, which close_all() elsewhere already handles."""
+            for instance in cls._all_instances:
+                instance.opts.update(new_opts)
 
         def add_command(self, label="", command=None, accelerator="", state="normal"):
             self.items.append({
@@ -1070,6 +1336,20 @@ def run():
     )
     status_git_label.pack(side="left")
 
+    # A generic, transient "flash a message for a few seconds" slot - used
+    # by the plugin API's show_message() below, kept separate from the
+    # other status labels (each of which mirrors some persistent bit of
+    # state) since this one is meant to appear and then clear itself.
+    status_message_label = tk.Label(
+        status_bar,
+        text="",
+        bg=THEME["panel_header_bg"],
+        fg=THEME["accent"],
+        anchor="w",
+        padx=10
+    )
+    status_message_label.pack(side="left")
+
     status_focus_label = tk.Label(
         status_bar,
         text="",
@@ -1094,6 +1374,19 @@ def run():
         cursor="hand2"
     )
     status_timer_label.pack(side="left")
+
+    # Little "you've been typing for a while" flame - purely cosmetic,
+    # session-only (see fun_effects.StreakTracker), updated from
+    # on_key_release below and ticked down on its own by _streak_tick.
+    status_streak_label = tk.Label(
+        status_bar,
+        text="",
+        bg=THEME["panel_header_bg"],
+        fg=THEME["accent"],
+        anchor="w",
+        padx=6
+    )
+    status_streak_label.pack(side="left")
 
     status_filetype_label = tk.Label(
         status_bar,
@@ -1121,25 +1414,11 @@ def run():
         ".py": "Python",
         ".pyw": "Python",
         ".js": "JavaScript",
-        ".jsx": "JavaScript (React)",
-        ".ts": "TypeScript",
-        ".tsx": "TypeScript (React)",
         ".html": "HTML",
         ".htm": "HTML",
         ".css": "CSS",
-        ".json": "JSON",
-        ".md": "Markdown",
-        ".txt": "Plain Text",
-        ".sh": "Shell Script",
-        ".c": "C",
-        ".h": "C Header",
-        ".cpp": "C++",
-        ".hpp": "C++ Header",
         ".java": "Java",
-        ".xml": "XML",
-        ".yml": "YAML",
-        ".yaml": "YAML",
-        ".sql": "SQL",
+        ".txt": "Plain Text",
     }
 
     def get_language_label(path):
@@ -1147,6 +1426,139 @@ def run():
             return "Plain Text"
         _, ext = os.path.splitext(path)
         return LANGUAGE_LABELS.get(ext.lower(), "Plain Text")
+
+    # ---------- Comment/uncomment ----------
+    # Same "supported languages only" scope as linters.py/goto.py - an
+    # unrecognized extension (or a path-less unsaved buffer) just means
+    # Ctrl+/ does nothing, rather than guessing at a comment syntax that
+    # might be wrong. Python/JS/Java get a real per-line "//"/"#" toggle;
+    # CSS and HTML don't have a line-comment syntax at all, so they get a
+    # single block wrapped around the whole selection instead.
+    COMMENT_STYLES = {
+        ".py":   {"line": "#"},
+        ".pyw":  {"line": "#"},
+        ".js":   {"line": "//"},
+        ".java": {"line": "//"},
+        ".css":  {"block": ("/*", "*/")},
+        ".html": {"block": ("<!--", "-->")},
+        ".htm":  {"block": ("<!--", "-->")},
+    }
+
+    def _comment_style_for_path(path):
+        if not path:
+            return None
+        _, ext = os.path.splitext(path)
+        return COMMENT_STYLES.get(ext.lower())
+
+    # ---------- Explorer: filetype/folder icons ----------
+    # Small flat glyphs drawn pixel-by-pixel (tk.PhotoImage.put), the same
+    # technique _make_close_icon uses for the tab close button - no image
+    # assets, no new dependencies, just Tk. Colors are fixed (not pulled
+    # from THEME) and loosely follow the color coding most editors/GitHub
+    # already use for these languages, so they read the same regardless
+    # of which app theme is active.
+    _FILETYPE_ICON_COLORS = {
+        # Python gets its own two-tone body (blue over yellow) below,
+        # rather than one flat color, echoing the language's own logo.
+        ".py": ("#4b8bbe", "#ffd43b"),
+        ".pyw": ("#4b8bbe", "#ffd43b"),
+        ".js": "#f0db4f",
+        ".html": "#e34c26",
+        ".htm": "#e34c26",
+        ".css": "#1572b6",
+        ".java": "#ea2d2e",
+        ".txt": "#9da5b4",
+    }
+    _FILETYPE_ICON_FALLBACK = "#9da5b4"
+    _FOLDER_ICON_COLOR = "#dcb67a"
+
+    def _lighten_hex(color, factor):
+        color = color.lstrip("#")
+        r, g, b = int(color[0:2], 16), int(color[2:4], 16), int(color[4:6], 16)
+        r = int(r + (255 - r) * factor)
+        g = int(g + (255 - g) * factor)
+        b = int(b + (255 - b) * factor)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _make_file_icon(color, size=14):
+        """A plain document silhouette with a lightened notch in the top-
+        right corner standing in for a folded page corner. `color` is
+        either one hex string, or a (top, bottom) pair for a two-tone
+        body like Python's icon - everything else about the shape stays
+        the same either way."""
+        img = tk.PhotoImage(width=size, height=size)
+        x0, y0, x1, y1 = 2, 1, size - 2, size - 2
+        mid = (y0 + y1) // 2
+        top_color, bottom_color = color if isinstance(color, tuple) else (color, color)
+        for y in range(y0, y1):
+            row_color = top_color if y < mid else bottom_color
+            for x in range(x0, x1):
+                img.put(row_color, (x, y))
+        corner = 3
+        light = _lighten_hex(top_color, 0.4)
+        for y in range(y0, y0 + corner):
+            for x in range(x1 - corner, x1):
+                img.put(light, (x, y))
+        return img
+
+    def _make_folder_icon(color, size=14):
+        """A tab-topped folder silhouette (small raised tab over a wider
+        body) - a distinct shape from the file icon's plain rectangle so
+        folders and files are tellable apart at a glance even before
+        reading the label."""
+        img = tk.PhotoImage(width=size, height=size)
+        for y in range(2, 4):
+            for x in range(2, 8):
+                img.put(color, (x, y))
+        for y in range(4, size - 2):
+            for x in range(2, size - 2):
+                img.put(color, (x, y))
+        return img
+
+    def _build_filetype_icons():
+        folder_icon = _make_folder_icon(_FOLDER_ICON_COLOR)
+        generic_icon = _make_file_icon(_FILETYPE_ICON_FALLBACK)
+        file_icons = {
+            ext: _make_file_icon(color)
+            for ext, color in _FILETYPE_ICON_COLORS.items()
+        }
+        return folder_icon, file_icons, generic_icon
+
+    FOLDER_ICON, FILE_ICONS, GENERIC_FILE_ICON = _build_filetype_icons()
+
+    def tree_icon_for(path, is_dir):
+        if is_dir:
+            return FOLDER_ICON
+        _, ext = os.path.splitext(path)
+        return FILE_ICONS.get(ext.lower(), GENERIC_FILE_ICON)
+
+    _status_message_state = {"job": None}
+
+    def show_status_message(text, duration_ms=4000):
+        """Flashes `text` in the status bar's message slot for
+        `duration_ms`, then clears it - used by the plugin API's
+        show_message() (see PluginAPI/register below). Safe to call
+        again before a previous message's timer has fired: it cancels
+        the pending clear and restarts the clock, the same "latest call
+        wins" pattern used for every other debounced timer in this file
+        (highlight_job, resize_job, etc.), so a burst of messages just
+        shows the last one for the full duration instead of flickering."""
+        pending = _status_message_state["job"]
+        if pending is not None:
+            try:
+                root.after_cancel(pending)
+            except (ValueError, tk.TclError):
+                pass
+        status_message_label.config(text=text)
+
+        def clear():
+            _status_message_state["job"] = None
+            try:
+                status_message_label.config(text="")
+            except tk.TclError:
+                pass
+
+        _status_message_state["job"] = root.after(duration_ms, clear)
 
     def update_status_bar(editor):
         if not editor:
@@ -1187,17 +1599,21 @@ def run():
 
     project_tree = ttk.Treeview(explorer_frame, show="tree")
     project_tree.pack(fill="both", expand=True)
-    project_tree.tag_configure(
-        "active_file",
-        background=THEME["tree_active_bg"],
-        foreground=THEME["tree_active_fg"]
-    )
-    # Explorer row colors mirroring `git status` - staged/modified/
-    # untracked - refreshed by apply_git_status_tags() below whenever the
-    # tree or the Source Control tab reports new status.
-    project_tree.tag_configure("git_staged", foreground=THEME["accent"])
-    project_tree.tag_configure("git_modified", foreground=THEME["search_current_bg"])
-    project_tree.tag_configure("git_untracked", foreground=THEME["syntax_comment"])
+
+    def _apply_project_tree_theme():
+        project_tree.tag_configure(
+            "active_file",
+            background=THEME["tree_active_bg"],
+            foreground=THEME["tree_active_fg"]
+        )
+        # Explorer row colors mirroring `git status` - staged/modified/
+        # untracked - refreshed by apply_git_status_tags() below whenever the
+        # tree or the Source Control tab reports new status.
+        project_tree.tag_configure("git_staged", foreground=THEME["accent"])
+        project_tree.tag_configure("git_modified", foreground=THEME["search_current_bg"])
+        project_tree.tag_configure("git_untracked", foreground=THEME["syntax_comment"])
+
+    _apply_project_tree_theme()
 
     main_frame.add(explorer_frame, width=220, minsize=120, stretch="never")
 
@@ -1206,6 +1622,15 @@ def run():
 
     tab_control = ttk.Notebook(center_frame, style="EditorTabs.TNotebook")
     tab_control.pack(fill="both", expand=True)
+
+    # Shown instead of tab_control whenever there are zero tabs open (a
+    # fresh window, "File > New Window", or the last tab just got closed) -
+    # see _show_start_page/_hide_start_page further down, defined once the
+    # actions/recent-lists it links to all exist. Built here, empty and
+    # unpacked, so it's a permanent child of center_frame from the start -
+    # that keeps it in the same widget subtree _remap_widget_colors already
+    # walks on every theme switch, with no separate re-theming path needed.
+    start_page_frame = tk.Frame(center_frame, bg=THEME["editor_bg"], highlightthickness=0, bd=0)
 
     # ---------- Sliding tab-bottom indicator ----------
     # A thin accent-colored bar that glides to the selected tab instead of
@@ -1314,19 +1739,29 @@ def run():
     # survives a restart. Kept in a dict (like font_state) so nested
     # functions can mutate the list without `nonlocal`.
     recent_files_state = {"paths": load_recent_files()}
+    recent_folders_state = {"paths": load_recent_folders()}
 
     # Minimap - a zoomed-out overview of the whole file for quick
     # navigation, shared on/off state so new tabs match whatever the user
     # last chose.
     MINIMAP_WIDTH = 100
     minimap_state = {"visible": True}
-    # Fixed pixel height for every line-bar in the minimap - like VS Code/
-    # Sublime, a line is always a thin mark. row_height used to be
-    # canvas_h / row_count, which *stretched* each row to fill the whole
-    # strip vertically - fine for a long file, but on a short one it blew
-    # each line up into a tall, chunky block instead of leaving the rest
-    # of the strip empty underneath.
+
+    # Word wrap defaults off (matches the wrap="none" every tab used to be
+    # hard-coded to) - toggling it applies to every open tab/pane at once,
+    # the same "one setting, all tabs" pattern font size/theme already use.
+    word_wrap_state = {"enabled": False}
+    # Every row in the minimap is always this many pixels tall, in every
+    # file, regardless of file size - rows never stretch or shrink to fill
+    # the panel. The strip never scrolls either: once a file has more
+    # lines than fit at this fixed height, extra lines are bucketed
+    # together into the same row count instead (see render_minimap_content),
+    # so the whole file is always visible, just more heavily summarized for
+    # a longer file. MINIMAP_MAX_ROWS is only a sanity cap for extreme
+    # files (tens of thousands of lines) so one redraw doesn't have to
+    # create more canvas rectangles than that.
     MINIMAP_ROW_HEIGHT = 3
+    MINIMAP_MAX_ROWS = 20000
 
     # Minimap git-heatmap - a thin strip along the minimap's right edge
     # marking rows that contain lines added/modified since HEAD (or, for
@@ -1357,6 +1792,18 @@ def run():
         "last_flush": time.time(),
         "commits": 0,
     }
+
+    # Purely cosmetic typing-streak flame (see fun_effects.StreakTracker) -
+    # updated eagerly on every keystroke from on_key_release, and ticked
+    # here so it also clears itself a few seconds after typing stops
+    # rather than waiting for the next keystroke that never comes.
+    streak_tracker = fun_effects.StreakTracker()
+
+    def _streak_tick():
+        status_streak_label.config(text=streak_tracker.display())
+        root.after(1000, _streak_tick)
+
+    root.after(1000, _streak_tick)
 
     # ---------------- Output / Terminal panel ----------------
 
@@ -1733,7 +2180,20 @@ def run():
         the next one runs, the same as shell "&&". Interpreted languages
         still go through _spawn_run_console below, which is just this with
         a single step.
+
+        Returns (proc, code_path). `proc` is the Popen handle for the
+        console wrapper (cmd.exe / terminal emulator) - its own exit status
+        is NOT the program's exit status, since the wrapper's last command
+        is the "press a key to close" prompt, not the program itself (and
+        closing the window instead of pressing a key makes that prompt
+        exit non-zero on its own, which used to get misread as the
+        program having failed). `code_path` is a temp file the wrapper
+        writes the program's real exit code into right after it finishes,
+        before the prompt runs - the caller reads it once `proc` exits.
         """
+        fd, code_path = tempfile.mkstemp(prefix="editor_run_", suffix=".exitcode")
+        os.close(fd)
+
         if IS_WINDOWS:
             tokens = []
             for i, step in enumerate(argv_steps):
@@ -1744,12 +2204,22 @@ def run():
             # every token passed as its own list element (not pre-joined
             # into one string) so subprocess's list2cmdline quotes only the
             # tokens that actually need it, and cmd.exe's own parsing of
-            # "&&"/"&" as separate arguments works the way it expects.
+            # "&&"/"&"/">" as separate arguments works the way it expects.
+            #
+            # !errorlevel! (not %errorlevel%) is deliberate: cmd.exe
+            # expands every %variable% in a command line ONCE, before
+            # running any part of it - so %errorlevel% here would always
+            # read cmd's errorlevel from before the program even ran (0),
+            # regardless of what actually happened. /v:on turns on delayed
+            # expansion, where !errorlevel! is resolved at the moment that
+            # echo actually executes, after the real chain has finished.
             return subprocess.Popen(
-                ["cmd.exe", "/c"] + tokens + ["&", "echo.", "&", "pause"],
+                ["cmd.exe", "/v:on", "/c"] + tokens
+                + ["&", "echo", "!errorlevel!", ">", code_path]
+                + ["&", "echo.", "&", "pause"],
                 cwd=run_dir,
                 creationflags=subprocess.CREATE_NEW_CONSOLE,
-            )
+            ), code_path
 
         command_line = " && ".join(
             " ".join(shlex.quote(tok) for tok in step) for step in argv_steps
@@ -1759,16 +2229,18 @@ def run():
             script = (
                 f"cd {shlex.quote(run_dir)}\n"
                 f"{command_line}\n"
+                f"echo $? > {shlex.quote(code_path)}\n"
                 "echo\nread -n 1 -s -r -p 'Press any key to close...'\n"
             )
             with tempfile.NamedTemporaryFile(mode="w", suffix=".command", delete=False) as tmp:
                 tmp.write(script)
                 script_path = tmp.name
             os.chmod(script_path, 0o755)
-            return subprocess.Popen(["open", script_path])
+            return subprocess.Popen(["open", script_path]), code_path
 
         inner = (
             f"cd {shlex.quote(run_dir)} && {command_line}; "
+            f"echo $? > {shlex.quote(code_path)}; "
             "echo; read -n 1 -s -r -p 'Press any key to close...'"
         )
         for exe, args in (
@@ -1780,7 +2252,7 @@ def run():
         ):
             path = shutil.which(exe)
             if path:
-                return subprocess.Popen([path] + args)
+                return subprocess.Popen([path] + args), code_path
         raise RuntimeError(
             "No terminal emulator found to run the program in "
             "(tried gnome-terminal, konsole, xfce4-terminal, xterm)."
@@ -1789,8 +2261,8 @@ def run():
     def _spawn_run_console(interpreter, filename, run_dir):
         """Spawns a new console window that runs `interpreter filename`
         (cwd=run_dir) and pauses at the end so the output stays on screen
-        - the same handoff Code::Blocks/Dev-C++ do for "Run". Returns the
-        Popen handle for the spawned process."""
+        - the same handoff Code::Blocks/Dev-C++ do for "Run". Returns
+        (proc, code_path) - see _spawn_run_console_multi for what each is."""
         return _spawn_run_console_multi([[interpreter, filename]], run_dir)
 
     def kill_running():
@@ -1859,6 +2331,15 @@ def run():
     # rather than adding a bracket-specific palette to every theme).
     BRACKET_DEPTH_KEYS = ("syntax_keyword", "syntax_function", "syntax_number", "accent")
     BRACKET_DEPTH_TAGS = tuple(f"bracket_depth_{i}" for i in range(len(BRACKET_DEPTH_KEYS)))
+
+    # When an editor is split, the second pane's content is a mirror of
+    # the first rather than being lexed independently - these are the
+    # tags copied across on every sync, i.e. everything that colors the
+    # text itself. Cursor/selection-adjacent tags (current_line,
+    # bracket_match, search_match/current) are deliberately left out:
+    # each pane has its own cursor and its own search state, so those
+    # should stay local to whichever pane they're actually happening in.
+    SPLIT_MIRROR_TAGS = ("keyword", "string", "comment", "number", "function") + BRACKET_DEPTH_TAGS
 
     def setup_highlight_tags(text_area):
         text_area.tag_configure("keyword", foreground=THEME["syntax_keyword"])
@@ -2561,6 +3042,12 @@ def run():
                     update_lint_squiggles(ed)
                     update_lint_status_label(ed)
 
+                    error_count = sum(1 for d in diagnostics if d.get("severity") == "error")
+                    prev_count = ed.get("_prev_lint_error_count", 0)
+                    if error_count > prev_count:
+                        fun_effects.error_flash(ed["editor_frame"])
+                    ed["_prev_lint_error_count"] = error_count
+
                 try:
                     ed["text"].after(0, apply)
                 except tk.TclError:
@@ -2572,11 +3059,14 @@ def run():
 
     # ---------- Minimap ----------
     # A zoomed-out overview of the whole file rendered as a strip of tiny
-    # bars (one per line, or one per bucket of lines once the file is
-    # taller than the strip has pixels for) plus a draggable box showing
-    # what's currently visible in the real editor - the same idea as
-    # VS Code/Sublime's minimap, done cheaply with a handful of rectangles
-    # on a Canvas rather than actually rendering miniature text.
+    # bars (one per line, or one per bucket of lines once the file has more
+    # lines than MINIMAP_MAX_ROWS) plus a draggable box showing what's
+    # currently visible in the real editor - the same idea as VS Code/
+    # Sublime's minimap, done cheaply with a handful of rectangles on a
+    # Canvas rather than actually rendering miniature text. The strip
+    # itself is stationary - it always shows the entire file squeezed into
+    # the panel's current height, so there's nothing to pan or scroll;
+    # navigation happens entirely through the viewport box.
     def render_minimap_content(editor):
         canvas = editor.get("minimap")
         if canvas is None or not canvas.winfo_exists():
@@ -2594,15 +3084,20 @@ def run():
         if canvas_w <= 1 or canvas_h <= 1 or total_lines == 0:
             return
 
-        # A row is always MINIMAP_ROW_HEIGHT tall, like a real minimap - it
-        # never stretches to fill the strip. Once there are more source
-        # lines than fit at that height, each row instead represents a
-        # bucket of several lines, so a long file still gets compressed to
-        # fit top-to-bottom; a short file just leaves the rest blank.
+        # Every row is always MINIMAP_ROW_HEIGHT tall, in every file,
+        # regardless of how many lines it has - rows never stretch or
+        # shrink to match the panel height. To keep the whole file
+        # visible with no scrolling, longer files just bucket more source
+        # lines into each row instead: row_count is capped at however many
+        # fixed-height rows actually fit in canvas_h, so a big file is
+        # summarized down to fit while a small one only fills part of the
+        # panel and leaves the rest blank underneath.
         row_height = MINIMAP_ROW_HEIGHT
-        max_rows = max(1, int(canvas_h / row_height))
-        row_count = min(total_lines, max_rows)
+        max_rows_that_fit = max(1, int(canvas_h / row_height))
+        row_count = min(total_lines, max_rows_that_fit, MINIMAP_MAX_ROWS)
         lines_per_row = total_lines / row_count
+        virtual_height = row_count * row_height
+        editor["minimap_virtual_height"] = virtual_height
 
         # Git heatmap - reserve a thin strip on the right edge for rows
         # whose lines were added/modified since HEAD. Uses whatever
@@ -2620,9 +3115,14 @@ def run():
         longest = min(max(longest, 1), 200)
         scale = (canvas_w - 6 - heat_reserve) / longest
 
-        keyword_color = THEME["syntax_keyword"]
-        comment_color = THEME["syntax_comment"]
-        default_color = THEME.get("muted_fg", THEME["editor_fg"])
+        # Themes can optionally define softer minimap-only variants of
+        # these colors (see LIGHT_THEME in themes.py) since a color that
+        # reads fine as actual on-screen text can look like a solid slab
+        # once it's filling a whole minimap row - themes that don't
+        # define these just keep using their normal syntax colors here.
+        keyword_color = THEME.get("minimap_keyword", THEME["syntax_keyword"])
+        comment_color = THEME.get("minimap_comment", THEME["syntax_comment"])
+        default_color = THEME.get("minimap_default", THEME.get("muted_fg", THEME["editor_fg"]))
         # Same color language as the explorer's git status tags (see
         # apply_git_status_tags): green for new content, amber for
         # changed-but-preexisting content.
@@ -2734,9 +3234,14 @@ def run():
         if canvas_w <= 1 or canvas_h <= 1:
             return
 
+        # The rendered rows only fill minimap_virtual_height pixels (a
+        # short file doesn't stretch to fill the whole panel - see
+        # render_minimap_content), so the viewport box maps against that,
+        # not the panel's full canvas_h.
+        virtual_height = editor.get("minimap_virtual_height") or canvas_h
         first, last = editor["text"].yview()
-        y1 = first * canvas_h
-        y2 = last * canvas_h
+        y1 = first * virtual_height
+        y2 = last * virtual_height
         if y2 - y1 < 3:
             y2 = y1 + 3
 
@@ -2751,17 +3256,25 @@ def run():
         the cursor - that's what makes dragging the box feel natural."""
         ed = editor
         canvas = ed["minimap"]
-        canvas_h = canvas.winfo_height()
-        if canvas_h <= 1:
+        virtual_height = ed.get("minimap_virtual_height") or canvas.winfo_height()
+        if virtual_height <= 1:
             return "break"
 
-        frac = min(max(event.y / canvas_h, 0.0), 1.0)
+        frac = min(max(event.y / virtual_height, 0.0), 1.0)
         first, last = ed["text"].yview()
         visible = max(last - first, 0.0)
         target = frac - visible / 2
         target = min(max(target, 0.0), max(0.0, 1.0 - visible))
         ed["text"].yview_moveto(target)
         render_minimap_viewport(ed)
+        return "break"
+
+    def minimap_press(event, editor):
+        minimap_navigate(event, editor)
+        return "break"
+
+    def minimap_drag(event, editor):
+        minimap_navigate(event, editor)
         return "break"
 
     # ---------- Dirty / title tracking ----------
@@ -3182,7 +3695,12 @@ def run():
     def bind_autocomplete(text_area, editor):
         ac = {
             "popup": None, "listbox": None, "start": None, "accept": None, "close": None,
-            "import_map": {}, "import_source": None
+            "import_map": {}, "import_source": None,
+            # Cache for the whole-buffer identifier scan gather_candidates()
+            # uses for plain-word completion (as opposed to the "attr" path,
+            # which already has its own cache via import_source above).
+            # Populated by _refresh_word_pool below.
+            "word_pool": frozenset(), "word_pool_job": None,
         }
         editor["autocomplete"] = ac
 
@@ -3205,6 +3723,28 @@ def run():
                 ac["import_map"] = _build_import_map(import_source)
                 ac["import_source"] = import_source
             return ac["import_map"]
+
+        def _refresh_word_pool():
+            # A full text_area.get("1.0", "end") + regex scan over the
+            # whole buffer - same cost profile as the syntax highlighter's
+            # full-document pass, so it gets the same treatment: debounced
+            # rather than run inline on every keystroke (see
+            # _schedule_word_pool_refresh below). Previously this ran
+            # straight in gather_candidates() on every single keystroke
+            # while a completion prefix was active, which made typing an
+            # identifier in a large file noticeably laggier than typing
+            # anywhere else in the editor.
+            ac["word_pool_job"] = None
+            if not text_area.winfo_exists():
+                return
+            text = text_area.get("1.0", "end")
+            ac["word_pool"] = frozenset(re.findall(r"[A-Za-z_]\w{1,}", text))
+
+        def _schedule_word_pool_refresh():
+            pending = ac["word_pool_job"]
+            if pending is not None:
+                text_area.after_cancel(pending)
+            ac["word_pool_job"] = text_area.after(400, _refresh_word_pool)
 
         def current_completion_context():
             before_cursor = text_area.get("insert linestart", "insert")
@@ -3234,15 +3774,27 @@ def run():
                     return []
                 return _attribute_candidates(obj, prefix)
 
-            text = text_area.get("1.0", "end")
-            words = set(re.findall(r"[A-Za-z_]\w{1,}", text))
-            pool = words | set(keyword.kwlist) | _BUILTIN_NAMES
+            # Word pool is refreshed on a debounce (see
+            # _schedule_word_pool_refresh) rather than rescanned here on
+            # every keystroke; a moment of staleness (missing an
+            # identifier someone is mid-way through typing elsewhere in
+            # the file) is a fine trade for not re-scanning the whole
+            # buffer per character, same reasoning as the syntax
+            # highlighter's own debounced full-document pass.
+            if not ac["word_pool"] and ac["word_pool_job"] is None:
+                # Nothing cached yet this session (popup opened before the
+                # first debounce fired) - do one synchronous scan so
+                # completion still works immediately rather than staying
+                # empty until the timer catches up.
+                _refresh_word_pool()
+            pool = ac["word_pool"] | set(keyword.kwlist) | _BUILTIN_NAMES
             prefix_lower = prefix.lower()
             matches = sorted(
                 w for w in pool
                 if w != prefix and w.lower().startswith(prefix_lower)
             )
             return matches[:8]
+
 
         def accept():
             listbox = ac["listbox"]
@@ -3313,6 +3865,8 @@ def run():
             if event.keysym in NAV_IGNORED_KEYS:
                 return
 
+            _schedule_word_pool_refresh()
+
             kind, chain, prefix, start_index = current_completion_context()
             if kind is None:
                 close_popup()
@@ -3380,6 +3934,14 @@ def run():
         editor["line_numbers"].tag_configure(
             "active_line_number", font=(font[0], font[1], "bold")
         )
+        fold_gutter = editor.get("fold_gutter")
+        if fold_gutter is not None:
+            fold_gutter.config(font=font)
+        pane2 = editor.get("pane2")
+        if pane2 is not None:
+            pane2["text"].config(font=font)
+            pane2["line_numbers"].config(font=font)
+            pane2["fold_gutter"].config(font=font)
         update_indent_guides(editor)
         update_lint_squiggles(editor)
 
@@ -3419,14 +3981,30 @@ def run():
             zoom_out()
         return "break"
 
-    def create_tab(path=None, content=""):
-        tab_frame = tk.Frame(tab_control, bg=THEME["editor_bg"], highlightthickness=0, bd=0)
+    def _on_fold_toggled(editor):
+        """A gutter click just hid or revealed a chunk of lines - anything
+        that was positioned/drawn against the old set of visible lines
+        needs to catch up, the same set of "the viewport just changed
+        underneath us" follow-ups on_text_scroll already does for regular
+        scrolling."""
+        update_indent_guides(editor)
+        mc = editor.get("multi_cursor")
+        if mc and mc["cursors"]:
+            mc["draw_carets"]()
+        render_minimap_viewport(editor)
+        update_lint_squiggles(editor)
 
-        editor_frame = tk.Frame(tab_frame, bg=THEME["editor_bg"], highlightthickness=0, bd=0)
-        editor_frame.pack(fill="both", expand=True)
+    def _build_editor_pane(parent, wrap_mode):
+        """Builds one gutter+fold-gutter+text+scrollbar group - the unit
+        that create_tab uses for the primary pane, and split_editor()
+        below reuses verbatim for a second pane. Returns the individual
+        widgets rather than a dict since the two call sites want them
+        merged into differently-shaped structures (the top-level `editor`
+        dict vs. a nested "pane2" dict)."""
+        pane_frame = tk.Frame(parent, bg=THEME["editor_bg"], highlightthickness=0, bd=0)
 
         line_numbers = tk.Text(
-            editor_frame,
+            pane_frame,
             width=4,
             padx=4,
             takefocus=0,
@@ -3440,9 +4018,29 @@ def run():
         line_numbers.pack(side="left", fill="y")
         setup_line_number_tags(line_numbers)
 
-        text_area = tk.Text(
-            editor_frame,
+        # One-character-wide gutter for the little fold triangles, kept
+        # as its own Text widget (rather than folded into line_numbers'
+        # own text) so the fold engine can rebuild it on every keystroke
+        # pause without touching the line-number digits or their
+        # active-line glow tag.
+        fold_gutter = tk.Text(
+            pane_frame,
+            width=1,
+            padx=1,
+            takefocus=0,
+            border=0,
+            background=THEME["line_number_bg"],
+            foreground=THEME["lint_warning"],
+            state="disabled",
             wrap="none",
+            cursor="arrow",
+            font=current_editor_font()
+        )
+        fold_gutter.pack(side="left", fill="y")
+
+        text_area = tk.Text(
+            pane_frame,
+            wrap=wrap_mode,
             undo=True,
             font=current_editor_font(),
             background=THEME["editor_bg"],
@@ -3456,26 +4054,78 @@ def run():
         text_area.pack(side="left", fill="both", expand=True)
 
         text_scrollbar = ttk.Scrollbar(
-            editor_frame,
+            pane_frame,
             orient="vertical",
             command=text_area.yview,
             style="Vertical.TScrollbar"
         )
         text_scrollbar.pack(side="left", fill="y")
 
+        def on_linenum_scroll(event, ta=text_area):
+            ta.yview_scroll(int(-event.delta / 120), "units")
+            return "break"
+
+        line_numbers.bind("<MouseWheel>", on_linenum_scroll)
+        line_numbers.bind("<Control-MouseWheel>", on_editor_ctrl_wheel)
+        fold_gutter.bind("<MouseWheel>", on_linenum_scroll)
+
+        # Bound on the widget itself (not root) and returning "break" -
+        # Tk's Text widget has a built-in class binding on Control-slash
+        # that selects the whole buffer, which takes priority over a
+        # plain root.bind() for the same keysym. Binding directly on
+        # text_area is the only way to reliably override that default.
+        def on_toggle_comment_key(event):
+            toggle_comment()
+            return "break"
+
+        text_area.bind("<Control-slash>", on_toggle_comment_key)
+
+        # Dropping a file straight onto the editor surface (not just the
+        # tab bar or the explorer tree) opens it too. _on_files_dropped
+        # itself is defined further down in this same function - wrapped
+        # in a lambda so the name is only looked up when a drop actually
+        # happens, by which point it's long since been defined (this
+        # whole app is one big function body, executed top to bottom
+        # before the mainloop starts).
+        if tkinterdnd2:
+            text_area.drop_target_register(tkinterdnd2.DND_FILES)
+            text_area.dnd_bind("<<Drop>>", lambda e: _on_files_dropped(e))
+
+        return pane_frame, line_numbers, fold_gutter, text_area, text_scrollbar
+
+    def create_tab(path=None, content=""):
+        _hide_start_page()
+
+        tab_frame = tk.Frame(tab_control, bg=THEME["editor_bg"], highlightthickness=0, bd=0)
+
+        editor_frame = tk.Frame(tab_frame, bg=THEME["editor_bg"], highlightthickness=0, bd=0)
+        editor_frame.pack(fill="both", expand=True)
+
+        # A PanedWindow holding just the one pane, to begin with -
+        # split_editor() adds a second draggable-divider pane into this
+        # same widget later without anything above it needing to change.
+        panes = ttk.PanedWindow(editor_frame, orient="horizontal")
+        panes.pack(side="left", fill="both", expand=True)
+
+        pane_frame, line_numbers, fold_gutter, text_area, text_scrollbar = _build_editor_pane(
+            panes, "word" if word_wrap_state["enabled"] else "none"
+        )
+        panes.add(pane_frame, weight=1)
+
         minimap = tk.Canvas(
             editor_frame,
             width=MINIMAP_WIDTH,
             highlightthickness=0,
             bd=0,
-            bg=THEME["line_number_bg"]
+            bg=THEME["editor_bg"]
         )
         if minimap_state["visible"]:
             minimap.pack(side="left", fill="y")
 
-        def on_text_scroll(first, last, ln=line_numbers, sb=text_scrollbar):
+        def on_text_scroll(first, last, ln=line_numbers, fg=fold_gutter, sb=text_scrollbar):
             sb.set(first, last)
             ln.yview_moveto(float(first))
+            fg.yview_moveto(float(first))
             # Scrolling shifts which lines/pixels are on screen, so the
             # guide overlay (positioned in real pixel coordinates) needs
             # to be redrawn to match.
@@ -3488,21 +4138,18 @@ def run():
 
         text_area.config(yscrollcommand=on_text_scroll)
 
-        def on_linenum_scroll(event, ta=text_area):
-            ta.yview_scroll(int(-event.delta / 120), "units")
-            return "break"
-
-        line_numbers.bind("<MouseWheel>", on_linenum_scroll)
-        line_numbers.bind("<Control-MouseWheel>", on_editor_ctrl_wheel)
-
         tab_id = str(tab_frame)
         title = make_tab_title(path)
 
         editor = {
             "frame": tab_frame,
             "editor_frame": editor_frame,
+            "panes": panes,
+            "pane1_frame": pane_frame,
+            "pane2": None,
             "text": text_area,
             "line_numbers": line_numbers,
+            "fold_gutter": fold_gutter,
             "minimap": minimap,
             "path": path,
             "title": title,
@@ -3514,6 +4161,7 @@ def run():
             "full_highlight_job": None,
             "highlight_last_line_count": None,
             "minimap_resize_job": None,
+            "minimap_virtual_height": None,
             "last_line_count": None,
             "git_heat": {"added": set(), "modified": set(), "untracked": False},
             "diagnostics": [],
@@ -3523,7 +4171,12 @@ def run():
             "lint_pool_used": 0,
             "lint_tooltip": None,
             "lint_hover_job": None,
+            "wrap_enabled": word_wrap_state["enabled"],
         }
+        editor["fold"] = code_folding.FoldEngine(
+            text_area, line_numbers, fold_gutter,
+            on_toggle=lambda ed=editor: _on_fold_toggled(ed)
+        )
         tab_editors[tab_id] = editor
 
         def on_minimap_resize(event, ed=editor):
@@ -3546,8 +4199,8 @@ def run():
             return "break"
 
         minimap.bind("<Configure>", on_minimap_resize)
-        minimap.bind("<Button-1>", lambda e, ed=editor: minimap_navigate(e, ed))
-        minimap.bind("<B1-Motion>", lambda e, ed=editor: minimap_navigate(e, ed))
+        minimap.bind("<Button-1>", lambda e, ed=editor: minimap_press(e, ed))
+        minimap.bind("<B1-Motion>", lambda e, ed=editor: minimap_drag(e, ed))
         minimap.bind("<MouseWheel>", on_minimap_wheel)
 
         def on_text_resize(event, ed=editor):
@@ -3590,6 +4243,7 @@ def run():
             highlight_current_line(ed)
             highlight_brackets(ed["text"])
             update_status_bar(ed)
+            status_streak_label.config(text=streak_tracker.keystroke())
 
             # The full-document passes (gutter rebuild, syntax re-tagging,
             # indent guides) are debounced: a fast typist re-triggers
@@ -3604,14 +4258,7 @@ def run():
 
             def do_heavy_update(ed=ed):
                 ed["highlight_job"] = None
-                if not ed["text"].winfo_exists():
-                    return
-                update_line_numbers(ed)
-                changed_line = int(ed["text"].index(tk.INSERT).split(".")[0])
-                highlight_syntax(ed, changed_line=changed_line)
-                update_indent_guides(ed)
-                render_minimap_content(ed)
-                run_lint(ed)
+                _run_editor_heavy_update(ed)
 
             ed["highlight_job"] = ed["text"].after(80, do_heavy_update)
 
@@ -3675,6 +4322,7 @@ def run():
         highlight_current_line(editor)
         highlight_brackets(text_area)
         update_indent_guides(editor)
+        editor["fold"].render()
         text_area.after_idle(lambda ed=editor: render_minimap_content(ed))
         text_area.after_idle(lambda ed=editor: refresh_minimap_heat(ed))
         run_lint(editor)
@@ -3685,12 +4333,15 @@ def run():
 
     def save_editor(editor):
         if editor["path"]:
+            content = editor["text"].get("1.0", "end-1c")
             with open(editor["path"], "w", encoding="utf-8") as f:
-                f.write(editor["text"].get("1.0", "end-1c"))
+                f.write(content)
             mark_clean(editor)
             refresh_git_state()
+            _notify_plugins_on_save(editor["path"], content)
+            return True
         else:
-            save_editor_as(editor)
+            return save_editor_as(editor)
 
     def save_editor_as(editor):
         path = filedialog.asksaveasfilename(
@@ -3698,9 +4349,10 @@ def run():
             filetypes=[("Python files", "*.py"), ("All files", "*.*")]
         )
         if not path:
-            return
+            return False
+        content = editor["text"].get("1.0", "end-1c")
         with open(path, "w", encoding="utf-8") as f:
-            f.write(editor["text"].get("1.0", "end-1c"))
+            f.write(content)
         editor["path"] = path
         editor["title"] = os.path.basename(path)
         mark_clean(editor)
@@ -3710,6 +4362,8 @@ def run():
         _remember_recent_file(path)
         highlight_syntax(editor)
         run_lint(editor)
+        _notify_plugins_on_save(path, content)
+        return True
 
     def prompt_save_if_dirty(editor, tab_id):
         """Returns True if it's OK to proceed (close/exit), False to abort."""
@@ -3789,23 +4443,377 @@ def run():
         ac = editor.get("autocomplete")
         if ac and ac.get("close"):
             ac["close"]()
+        if ac:
+            pending = ac.get("word_pool_job")
+            if pending is not None:
+                try:
+                    editor["text"].after_cancel(pending)
+                except tk.TclError:
+                    pass
 
         mc = editor.get("multi_cursor")
         if mc and mc.get("clear"):
             mc["clear"]()
 
+        pending = editor.get("pane2_highlight_job")
+        pane2 = editor.get("pane2")
+        if pending is not None and pane2 is not None:
+            try:
+                pane2["text"].after_cancel(pending)
+            except tk.TclError:
+                pass
+
         del tab_editors[tab_id]
         tab_control.forget(editor["frame"])
         editor["frame"].destroy()
 
-        # Never let the editor end up with zero tabs open
+        # Never let the editor end up with a bare empty notebook and
+        # nothing to do - show the Start Page instead of quietly spawning
+        # a blank "Untitled" tab nobody asked for.
         if not tab_control.tabs():
-            create_tab()
+            _show_start_page()
 
     def close_other_tabs(tab_id):
         for other_id in list(tab_editors.keys()):
             if other_id != tab_id:
                 close_tab(other_id)
+
+    # ---------------- Word wrap ----------------
+    def toggle_word_wrap():
+        word_wrap_state["enabled"] = not word_wrap_state["enabled"]
+        mode = "word" if word_wrap_state["enabled"] else "none"
+        for ed in tab_editors.values():
+            ed["wrap_enabled"] = word_wrap_state["enabled"]
+            ed["text"].config(wrap=mode)
+            pane2 = ed.get("pane2")
+            if pane2:
+                pane2["text"].config(wrap=mode)
+        view_menu.entryconfig(
+            word_wrap_menu_index,
+            label="Disable Word Wrap" if word_wrap_state["enabled"] else "Enable Word Wrap"
+        )
+
+    # ---------------- Code folding commands ----------------
+    def _focused_pane(editor):
+        """Whichever of the (up to two) panes currently has focus - fold
+        commands act on that one specifically, since a split editor's two
+        panes fold independently."""
+        pane2 = editor.get("pane2")
+        if pane2 and pane2["text"].winfo_exists():
+            try:
+                if root.focus_get() is pane2["text"]:
+                    return pane2
+            except tk.TclError:
+                pass
+        return editor
+
+    def toggle_fold_at_cursor(editor=None):
+        editor = editor or get_current_editor()
+        if not editor:
+            return
+        target = _focused_pane(editor)
+        line = int(target["text"].index("insert").split(".")[0])
+        target["fold"].toggle_at_line(line)
+        _on_fold_toggled(editor)
+
+    def fold_all_current(editor=None):
+        editor = editor or get_current_editor()
+        if not editor:
+            return
+        target = _focused_pane(editor)
+        target["fold"].fold_all()
+        _on_fold_toggled(editor)
+
+    def unfold_all_current(editor=None):
+        editor = editor or get_current_editor()
+        if not editor:
+            return
+        target = _focused_pane(editor)
+        target["fold"].unfold_all()
+        _on_fold_toggled(editor)
+
+    # ---------------- Heavy update pipeline (shared by both panes) ----------------
+    def _run_editor_heavy_update(ed):
+        """The full recompute pass that runs (debounced) after any edit:
+        gutter rebuild, syntax re-tagging, indent guides, minimap, lint,
+        fold gutter, and - if this editor is split - mirroring the fresh
+        result over to the second pane. Factored out of create_tab's
+        on_key_release closure so a split pane's own KeyRelease handler
+        (see split_editor below) can trigger the exact same pipeline
+        rather than maintaining a second, diverging copy of it."""
+        if not ed["text"].winfo_exists():
+            return
+        update_line_numbers(ed)
+        changed_line = int(ed["text"].index(tk.INSERT).split(".")[0])
+        highlight_syntax(ed, changed_line=changed_line)
+        update_indent_guides(ed)
+        render_minimap_content(ed)
+        run_lint(ed)
+        fold = ed.get("fold")
+        if fold:
+            fold.render()
+        sync_split_pane(ed, source="text")
+
+    # ---------------- Split editor (multiple panes on one file) ----------------
+    def sync_split_pane(editor, source="text"):
+        """If `editor` currently has a second pane open, mirrors content
+        from `source` ("text" for the primary pane, "text2" for the
+        split one) into the other pane - both showing the same
+        underlying file, just possibly scrolled/folded differently, the
+        same way two split views onto one file behave in a "real"
+        editor. When the primary is the source, its already-computed
+        syntax-highlight tag ranges are copied over too rather than
+        re-lexing the second pane from scratch; when the split pane is
+        the source, tags are left alone since _run_editor_heavy_update
+        recomputes the primary's own highlighting right afterward and
+        that pass re-syncs (with tags) back out to the split pane anyway.
+        """
+        pane2 = editor.get("pane2")
+        if not pane2:
+            return
+        if editor.get("_pane_syncing"):
+            return
+
+        src = editor["text"] if source == "text" else pane2["text"]
+        dst = pane2["text"] if source == "text" else editor["text"]
+        if not src.winfo_exists() or not dst.winfo_exists():
+            return
+
+        src_content = src.get("1.0", "end-1c")
+        if src_content == dst.get("1.0", "end-1c"):
+            return
+
+        editor["_pane_syncing"] = True
+        try:
+            yview = dst.yview()
+            dst.delete("1.0", "end")
+            dst.insert("1.0", src_content)
+            dst.edit_modified(False)
+            try:
+                dst.yview_moveto(yview[0])
+            except tk.TclError:
+                pass
+
+            if source == "text":
+                for tag in SPLIT_MIRROR_TAGS:
+                    dst.tag_remove(tag, "1.0", "end")
+                    ranges = src.tag_ranges(tag)
+                    for i in range(0, len(ranges), 2):
+                        dst.tag_add(tag, ranges[i], ranges[i + 1])
+
+            dst_line_numbers = pane2["line_numbers"] if source == "text" else editor["line_numbers"]
+            num_lines = int(dst.index("end-1c").split(".")[0])
+            dst_line_numbers.config(state="normal")
+            dst_line_numbers.delete("1.0", tk.END)
+            dst_line_numbers.insert("1.0", "\n".join(str(i) for i in range(1, num_lines + 1)))
+            dst_line_numbers.config(state="disabled")
+
+            dst_fold = pane2["fold"] if source == "text" else editor["fold"]
+            dst_fold.render()
+        finally:
+            editor["_pane_syncing"] = False
+
+    def _pane2_key_release(event, ed):
+        pending = ed.get("pane2_highlight_job")
+        if pending is not None:
+            try:
+                ed["pane2"]["text"].after_cancel(pending)
+            except tk.TclError:
+                pass
+
+        def do_update(ed=ed):
+            ed["pane2_highlight_job"] = None
+            pane2 = ed.get("pane2")
+            if not pane2 or not pane2["text"].winfo_exists():
+                return
+            mark_dirty(ed)
+            # The split pane is a mirror, not its own lexer - push its
+            # edit into the primary text widget and let the normal heavy
+            # pipeline (numbering/highlighting/lint/fold/minimap) run
+            # once there, then re-mirror the freshly-computed result
+            # back out. Two-step, but it means there's exactly one place
+            # that actually re-lexes the file.
+            sync_split_pane(ed, source="text2")
+            _run_editor_heavy_update(ed)
+
+        ed["pane2_highlight_job"] = ed["pane2"]["text"].after(80, do_update)
+
+    def split_editor(editor=None):
+        editor = editor or get_current_editor()
+        if not editor or editor.get("pane2"):
+            return
+
+        pane_frame, line_numbers2, fold_gutter2, text_area2, text_scrollbar2 = _build_editor_pane(
+            editor["panes"], "word" if word_wrap_state["enabled"] else "none"
+        )
+        editor["panes"].add(pane_frame, weight=1)
+        setup_highlight_tags(text_area2)
+
+        pane2 = {
+            "frame": pane_frame,
+            "text": text_area2,
+            "line_numbers": line_numbers2,
+            "fold_gutter": fold_gutter2,
+        }
+        pane2["fold"] = code_folding.FoldEngine(
+            text_area2, line_numbers2, fold_gutter2,
+            on_toggle=lambda ed=editor: _on_fold_toggled(ed)
+        )
+        editor["pane2"] = pane2
+
+        def on_pane2_scroll(first, last, ln=line_numbers2, fg=fold_gutter2, sb=text_scrollbar2):
+            sb.set(first, last)
+            ln.yview_moveto(float(first))
+            fg.yview_moveto(float(first))
+
+        text_area2.config(yscrollcommand=on_pane2_scroll)
+
+        def on_pane2_click(event, ed=editor):
+            def refresh(ed=ed):
+                pane2 = ed.get("pane2")
+                if pane2 and pane2["text"].winfo_exists():
+                    highlight_brackets(pane2["text"])
+            ed["text"].after_idle(refresh)
+
+        text_area2.bind("<KeyRelease>", lambda e, ed=editor: _pane2_key_release(e, ed))
+        text_area2.bind("<ButtonRelease-1>", on_pane2_click)
+        text_area2.bind("<Control-MouseWheel>", on_editor_ctrl_wheel)
+
+        # Seed pane 2 with the primary's current content/highlighting
+        # right away rather than waiting for the next edit.
+        sync_split_pane(editor, source="text")
+        text_area2.focus_set()
+
+    def close_split(editor=None):
+        editor = editor or get_current_editor()
+        if not editor:
+            return
+        pane2 = editor.get("pane2")
+        if not pane2:
+            return
+
+        pending = editor.get("pane2_highlight_job")
+        if pending is not None:
+            try:
+                pane2["text"].after_cancel(pending)
+            except tk.TclError:
+                pass
+
+        try:
+            editor["panes"].forget(pane2["frame"])
+        except tk.TclError:
+            pass
+        pane2["frame"].destroy()
+        editor["pane2"] = None
+        editor["text"].focus_set()
+
+    # ---------------- Comment / uncomment ----------------
+    def _comment_target_lines(text):
+        """The 1-based (start, end) line range Ctrl+/ should act on: the
+        selection if there is one, otherwise just the line the cursor is
+        on. A selection that runs down to column 0 of its last line (the
+        common result of dragging or Shift-Down through whole lines,
+        including the trailing newline) doesn't actually select anything
+        on that last line, so it's excluded - otherwise toggling a
+        3-line selection would also comment out the untouched 4th line
+        sitting right below it."""
+        try:
+            sel_start = text.index("sel.first")
+            sel_end = text.index("sel.last")
+        except tk.TclError:
+            line = int(text.index("insert").split(".")[0])
+            return line, line
+
+        start_line = int(sel_start.split(".")[0])
+        end_line, end_col = sel_end.split(".")
+        end_line = int(end_line)
+        if int(end_col) == 0 and end_line > start_line:
+            end_line -= 1
+        return start_line, end_line
+
+    def _toggle_line_comments(text, start_line, end_line, prefix):
+        lines = [text.get(f"{ln}.0", f"{ln}.end") for ln in range(start_line, end_line + 1)]
+        non_blank = [line for line in lines if line.strip()]
+        if not non_blank:
+            return
+
+        all_commented = all(line.lstrip().startswith(prefix) for line in non_blank)
+
+        if all_commented:
+            for ln in range(start_line, end_line + 1):
+                line = text.get(f"{ln}.0", f"{ln}.end")
+                stripped = line.lstrip()
+                if not stripped.startswith(prefix):
+                    continue
+                indent_len = len(line) - len(stripped)
+                remove_len = len(prefix) + 1 if stripped.startswith(prefix + " ") else len(prefix)
+                text.delete(f"{ln}.{indent_len}", f"{ln}.{indent_len + remove_len}")
+        else:
+            # Align every inserted marker to the shallowest indentation
+            # in the block (matching most editors' Ctrl+/ behavior),
+            # rather than each line commenting itself at its own indent -
+            # an if-block's body would otherwise end up with its markers
+            # in a jagged column instead of a clean flush left edge.
+            indents = [len(line) - len(line.lstrip()) for line in non_blank]
+            min_indent = min(indents)
+            for ln in range(start_line, end_line + 1):
+                if not text.get(f"{ln}.0", f"{ln}.end").strip():
+                    continue
+                text.insert(f"{ln}.{min_indent}", prefix + " ")
+
+    def _toggle_block_comment(text, start_line, end_line, open_marker, close_marker):
+        start_idx, end_idx = f"{start_line}.0", f"{end_line}.end"
+        content = text.get(start_idx, end_idx)
+        stripped = content.strip()
+
+        if stripped.startswith(open_marker) and stripped.endswith(close_marker):
+            open_pos = content.find(open_marker)
+            close_pos = content.rfind(close_marker)
+            if open_pos == -1 or close_pos == -1 or close_pos <= open_pos:
+                return
+            inner = content[open_pos + len(open_marker):close_pos]
+            if inner.startswith(" "):
+                inner = inner[1:]
+            if inner.endswith(" "):
+                inner = inner[:-1]
+            new_content = content[:open_pos] + inner + content[close_pos + len(close_marker):]
+        else:
+            new_content = f"{open_marker} {content} {close_marker}"
+
+        text.delete(start_idx, end_idx)
+        text.insert(start_idx, new_content)
+
+    def toggle_comment(editor=None):
+        editor = editor or get_current_editor()
+        if not editor:
+            return
+        style = _comment_style_for_path(editor.get("path"))
+        if not style:
+            return
+
+        target = _focused_pane(editor)
+        text = target["text"]
+        start_line, end_line = _comment_target_lines(text)
+
+        # Group the whole toggle (which may be several inserts/deletes
+        # across many lines) into a single Ctrl+Z step rather than
+        # leaving the user to undo it one line at a time.
+        text.config(autoseparators=False)
+        text.edit_separator()
+        try:
+            if "line" in style:
+                _toggle_line_comments(text, start_line, end_line, style["line"])
+            else:
+                open_marker, close_marker = style["block"]
+                _toggle_block_comment(text, start_line, end_line, open_marker, close_marker)
+        finally:
+            text.edit_separator()
+            text.config(autoseparators=True)
+
+        mark_dirty(editor)
+        if target is editor.get("pane2"):
+            sync_split_pane(editor, source="text2")
+        _run_editor_heavy_update(editor)
 
     def on_tab_changed(event=None):
         for ed in tab_editors.values():
@@ -3834,6 +4842,12 @@ def run():
         update_status_bar(editor)
         update_lint_squiggles(editor)
         update_lint_status_label(editor)
+        fold = editor.get("fold")
+        if fold:
+            fold.render()
+        pane2 = editor.get("pane2")
+        if pane2:
+            pane2["fold"].render()
         highlight_active_file()
         update_tab_indicator()
         # Matches found in the previous tab don't apply to this one.
@@ -3965,6 +4979,19 @@ def run():
         save_recent_files(paths)
         _rebuild_recent_files_menu()
 
+    def _remember_recent_folder(folder):
+        """Same bookkeeping as _remember_recent_file, but for project
+        folders - pushed to front (de-duped), capped, persisted, and the
+        Open Recent Folder submenu refreshed to match."""
+        if not folder:
+            return
+        paths = recent_folders_state["paths"]
+        paths[:] = [p for p in paths if p != folder]
+        paths.insert(0, folder)
+        del paths[MAX_RECENT_FOLDERS:]
+        save_recent_folders(paths)
+        _rebuild_recent_folders_menu()
+
     def _open_path_in_tab(path):
         existing_tab = find_tab_for_path(path)
         if existing_tab:
@@ -4007,6 +5034,7 @@ def run():
         else:
             create_tab(path=path, content=content)
         _remember_recent_file(path)
+        _notify_plugins_on_open(path, content)
 
     def open_file():
         path = filedialog.askopenfilename(
@@ -4050,16 +5078,18 @@ def run():
 
         for item in items:
             full_path = os.path.join(path, item)
+            is_dir = os.path.isdir(full_path)
 
             node = project_tree.insert(
                 parent,
                 "end",
                 text=item,
                 open=False,
-                values=[full_path]
+                values=[full_path],
+                image=tree_icon_for(full_path, is_dir)
             )
 
-            if os.path.isdir(full_path):
+            if is_dir:
                 project_tree.insert(node, "end", text="", values=[])
 
     def _on_tree_expand(event):
@@ -4085,7 +5115,8 @@ def run():
             "end",
             text=os.path.basename(folder),
             open=True,
-            values=[folder]
+            values=[folder],
+            image=FOLDER_ICON
         )
 
         add_directory(root_node, folder)
@@ -4096,6 +5127,8 @@ def run():
         populate_tree(folder)
         highlight_active_file()
         refresh_git_state()
+        _remember_recent_folder(folder)
+        _hide_start_page()
 
     def open_folder():
         folder = filedialog.askdirectory()
@@ -4208,12 +5241,28 @@ def run():
                 project_tree.see(node)
                 return
 
+    # Bumped on every apply_git_status_tags() call so a slow background
+    # `git status` that finishes after a newer refresh has already been
+    # kicked off (rapid focus-in/focus-out, a save right after a folder
+    # switch, etc.) knows to drop its now-stale result instead of painting
+    # tags for the wrong project over whatever the newer pass already drew.
+    _git_status_tag_state = {"seq": 0}
+
     def apply_git_status_tags():
         """Recolors explorer rows to reflect `git status` - accent for
         staged files, an attention color for modified-but-unstaged files,
-        and a muted-green for untracked ones. Cheap enough to call after
-        every tree refresh/save; does nothing if project_path isn't
-        inside a git repo (or no folder is open at all)."""
+        and a muted-green for untracked ones. Does nothing if project_path
+        isn't inside a git repo (or no folder is open at all).
+
+        The actual `git status` call is a subprocess (see git_panel._run)
+        and runs on a background thread, the same pattern already used for
+        every other git call in this file (refresh_minimap_heat, git_panel's
+        own refresh()/do_commit()/etc.) - it used to run straight on the UI
+        thread here, which meant every tree refresh, every save, and every
+        time the window regained focus (see _on_app_focus_in) froze the
+        whole editor for as long as `git status` took, which is very much
+        not "cheap enough to call liberally" on a large repo or a slow
+        (e.g. network) filesystem."""
         git_tags = ("git_staged", "git_modified", "git_untracked")
 
         def _clear(node):
@@ -4222,45 +5271,55 @@ def run():
             if kept != tags:
                 project_tree.item(node, tags=kept)
 
-        if not project_path:
+        _git_status_tag_state["seq"] += 1
+        seq = _git_status_tag_state["seq"]
+        path = project_path
+
+        if not path:
             for node in _walk_tree_nodes():
                 _clear(node)
             return
 
-        repo_root = git_panel.find_repo_root(project_path)
-        if not repo_root:
-            for node in _walk_tree_nodes():
-                _clear(node)
-            return
+        def worker(path=path, seq=seq):
+            repo_root = git_panel.find_repo_root(path)
+            status = git_panel.get_status(repo_root) if repo_root else None
 
-        status = git_panel.get_status(repo_root)
-        if status.get("error"):
-            for node in _walk_tree_nodes():
-                _clear(node)
-            return
+            def apply():
+                if _git_status_tag_state["seq"] != seq:
+                    return  # superseded by a newer refresh - drop it
+                if not project_tree.winfo_exists():
+                    return
+                if not repo_root or status.get("error"):
+                    for node in _walk_tree_nodes():
+                        _clear(node)
+                    return
 
-        def _abs_paths(entries):
-            return {os.path.normpath(os.path.join(repo_root, p)) for _, p in entries}
+                def _abs_paths(entries):
+                    return {os.path.normpath(os.path.join(repo_root, p)) for _, p in entries}
 
-        staged_paths = _abs_paths(status["staged"])
-        modified_paths = _abs_paths(status["unstaged"])
-        untracked_paths = _abs_paths(status["untracked"])
+                staged_paths = _abs_paths(status["staged"])
+                modified_paths = _abs_paths(status["unstaged"])
+                untracked_paths = _abs_paths(status["untracked"])
 
-        for node in _walk_tree_nodes():
-            values = project_tree.item(node, "values")
-            _clear(node)
-            if not values:
-                continue
-            path = os.path.normpath(values[0])
-            if path in staged_paths:
-                tag = "git_staged"
-            elif path in modified_paths:
-                tag = "git_modified"
-            elif path in untracked_paths:
-                tag = "git_untracked"
-            else:
-                continue
-            project_tree.item(node, tags=_node_tags(node) + (tag,))
+                for node in _walk_tree_nodes():
+                    values = project_tree.item(node, "values")
+                    _clear(node)
+                    if not values:
+                        continue
+                    node_path = os.path.normpath(values[0])
+                    if node_path in staged_paths:
+                        tag = "git_staged"
+                    elif node_path in modified_paths:
+                        tag = "git_modified"
+                    elif node_path in untracked_paths:
+                        tag = "git_untracked"
+                    else:
+                        continue
+                    project_tree.item(node, tags=_node_tags(node) + (tag,))
+
+            root.after(0, apply)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def refresh_tree(select_path=None):
         if not project_path:
@@ -4465,13 +5524,13 @@ def run():
 
     def save_file():
         editor = get_current_editor()
-        if editor:
-            save_editor(editor)
+        if editor and save_editor(editor):
+            fun_effects.glow(editor["editor_frame"], "#2ecc71")
 
     def save_as_file():
         editor = get_current_editor()
-        if editor:
-            save_editor_as(editor)
+        if editor and save_editor_as(editor):
+            fun_effects.glow(editor["editor_frame"], "#2ecc71")
 
     # ---------- Run code ----------
     # Runs the file through the same live shell backing the Terminal tab
@@ -4483,13 +5542,6 @@ def run():
     # Each entry describes how to go from "a saved file" to "something
     # running", as a dict with a "kind":
     #   "interpret" - run straight through an interpreter: [cmd, filename]
-    #   "compile"   - compile to a binary, then run that binary (C/C++)
-    #   "node_transform" - .ts/.tsx/.jsx can't run directly in node (no
-    #                 built-in TS/JSX support), so this reaches for the
-    #                 "tsx" package (https://github.com/privatenumber/tsx),
-    #                 a zero-config TS/JSX runner - using a global install
-    #                 if there is one, otherwise a one-off "npx -y tsx"
-    #                 (which downloads it to a cache on first use).
     #   "java"      - javac then java, keyed off the class name (which by
     #                 Java's own rules already has to match the filename
     #                 for a public top-level class)
@@ -4504,26 +5556,11 @@ def run():
         RUNNERS = {
             "Python": {"kind": "interpret", "cmd": "python3"},
             "JavaScript": {"kind": "interpret", "cmd": "node"},
-            "Shell Script": {"kind": "interpret", "cmd": "bash"},
         }
     RUNNERS.update({
-        "JavaScript (React)": {"kind": "node_transform"},
-        "TypeScript": {"kind": "node_transform"},
-        "TypeScript (React)": {"kind": "node_transform"},
-        "C": {"kind": "compile", "compiler": "gcc"},
-        "C++": {"kind": "compile", "compiler": "g++"},
         "Java": {"kind": "java"},
         "HTML": {"kind": "browser"},
     })
-
-    def _node_transform_steps(filename):
-        # Prefer a real "tsx" on PATH (fast, no network) - fall back to
-        # "npx -y tsx" (the "-y" skips npm's interactive "ok to install"
-        # prompt, which would otherwise sit unanswered in the spawned
-        # console) so this still works with nothing but Node installed.
-        if shutil.which("tsx"):
-            return [["tsx", filename]]
-        return [["npx", "-y", "tsx", filename]]
 
     def run_code():
         editor = get_current_editor()
@@ -4571,14 +5608,8 @@ def run():
             bottom_panel.select(output_tab)
             return
 
-        if spec["kind"] == "compile":
-            exe_name = stem + (".exe" if IS_WINDOWS else "")
-            run_token = exe_name if IS_WINDOWS else f"./{exe_name}"
-            steps = [[spec["compiler"], filename, "-o", exe_name], [run_token]]
-        elif spec["kind"] == "java":
+        if spec["kind"] == "java":
             steps = [["javac", filename], ["java", stem]]
-        elif spec["kind"] == "node_transform":
-            steps = _node_transform_steps(filename)
         else:  # "interpret"
             steps = [[spec["cmd"], filename]]
 
@@ -4589,7 +5620,7 @@ def run():
         bottom_panel.select(output_tab)
 
         try:
-            proc = _spawn_run_console_multi(steps, run_dir)
+            proc, code_path = _spawn_run_console_multi(steps, run_dir)
         except Exception as e:
             output_area.config(state="normal")
             output_area.insert(tk.END, f"\nFailed to launch: {e}\n")
@@ -4598,8 +5629,26 @@ def run():
 
         run_state["proc"] = proc
 
-        def wait_for_exit(p=proc):
-            code = p.wait()
+        def wait_for_exit(p=proc, code_path=code_path):
+            p.wait()
+
+            # The wrapper (cmd.exe / terminal emulator) has now closed, so
+            # the real exit code - written to code_path right after the
+            # program itself finished, before the "press a key" prompt
+            # could run - is ready to read. Falls back to None (unknown)
+            # if it's missing/unreadable, e.g. the window was killed before
+            # the program ever got a chance to run.
+            code = None
+            try:
+                with open(code_path, "r", encoding="utf-8") as f:
+                    code = int(f.read().strip())
+            except (OSError, ValueError):
+                pass
+            finally:
+                try:
+                    os.remove(code_path)
+                except OSError:
+                    pass
 
             def report():
                 # A newer Run may have started (and finished) while this
@@ -4607,8 +5656,13 @@ def run():
                 # this is still the process anyone would care about.
                 if run_state.get("proc") is p:
                     output_area.config(state="normal")
-                    output_area.insert(tk.END, f"\n[process exited with code {code}]\n")
+                    shown_code = code if code is not None else "unknown"
+                    output_area.insert(tk.END, f"\n[process exited with code {shown_code}]\n")
                     output_area.config(state="disabled")
+                    if code == 0:
+                        fun_effects.glow(output_frame, "#2ecc71")
+                    elif code is not None:
+                        fun_effects.glow(output_frame, "#ff5555")
 
             root.after(0, report)
 
@@ -4637,6 +5691,14 @@ def run():
         update_indent_guides(editor)
         render_minimap_content(editor)
         update_status_bar(editor)
+        # update_line_numbers() above may have torn down and reinserted the
+        # line-numbers gutter (if the replace changed the line count),
+        # which wipes any fold-hidden tag ranges on it - reapply them here
+        # so it stays in sync with the text/fold gutter, same as every
+        # other update_line_numbers() call site already does.
+        fold = editor.get("fold")
+        if fold:
+            fold.render()
 
     def _clear_search_highlights(editor):
         editor["text"].tag_remove("search_match", "1.0", tk.END)
@@ -4698,6 +5760,7 @@ def run():
         text_area.tag_add("search_current", pos, end)
         text_area.mark_set("insert", pos)
         text_area.see(pos)
+        fun_effects.cursor_pulse(text_area, pos, THEME["accent"], THEME["editor_bg"])
         _update_status()
 
     def _search_term_changed():
@@ -4914,11 +5977,9 @@ def run():
     # ---------- Settings dialog ----------
     # A single "Preferences" window for the stuff that's otherwise scattered
     # across the View menu (font, theme, minimap/heatmap/scanlines toggles).
-    # Font family/size and the toggles apply live as you change them - same
-    # spirit as Ctrl+scroll zoom already applying immediately. Theme still
-    # goes through set_theme(), which relaunches the app (see
-    # _switch_theme_and_relaunch below), so that one's a bigger, deliberate
-    # action rather than a live preview.
+    # Font family/size and the toggles apply live as you change them - and
+    # now so does theme, via set_theme() -> _apply_theme_live() (no more
+    # relaunch, just an in-place recolor of everything already on screen).
     settings_state = {"window": None}
 
     def _installed_font_choices():
@@ -5047,8 +6108,10 @@ def run():
         def _on_theme_change(*_args):
             chosen = theme_display_to_name.get(theme_var.get())
             if chosen:
-                # Relaunches the app (see _switch_theme_and_relaunch), so
-                # nothing after this line in the current process matters.
+                # Applies live via _apply_theme_live() - this window's own
+                # colors get swept up in that same pass since it's just
+                # another widget in the tree, so it doesn't need to be
+                # closed/reopened to pick up the new palette.
                 set_theme(chosen)
 
         theme_box.bind("<<ComboboxSelected>>", _on_theme_change)
@@ -5209,6 +6272,203 @@ def run():
     _rebuild_recent_files_menu()
     file_menu.add_cascade(label="Open Recent", menu=recent_files_menu)
 
+    recent_folders_menu = ThemedMenu(root, tearoff=0, **menu_opts)
+
+    def _open_recent_folder(folder):
+        if not os.path.isdir(folder):
+            messagebox.showerror("Open Recent Folder", f"{folder}\n\nThis folder no longer exists.")
+            paths = recent_folders_state["paths"]
+            if folder in paths:
+                paths.remove(folder)
+                save_recent_folders(paths)
+                _rebuild_recent_folders_menu()
+            return
+        _open_project_folder(folder)
+
+    def _clear_recent_folders():
+        recent_folders_state["paths"] = []
+        save_recent_folders([])
+        _rebuild_recent_folders_menu()
+
+    def _rebuild_recent_folders_menu():
+        recent_folders_menu.delete(0, tk.END)
+        paths = recent_folders_state["paths"]
+        if not paths:
+            recent_folders_menu.add_command(label="(No Recent Folders)", state="disabled")
+            return
+        for recent_folder in paths:
+            recent_folders_menu.add_command(
+                label=recent_folder, command=lambda f=recent_folder: _open_recent_folder(f)
+            )
+        recent_folders_menu.add_separator()
+        recent_folders_menu.add_command(label="Clear Recent Folders", command=_clear_recent_folders)
+
+    _rebuild_recent_folders_menu()
+    file_menu.add_cascade(label="Open Recent Folder", menu=recent_folders_menu)
+
+    # ---------------- Start Page ----------------
+    # Shown in start_page_frame (built up by tab_control, see above) instead
+    # of a blank "Untitled" tab whenever there are zero tabs open. Rebuilt
+    # from scratch every time it's shown so its two Recent columns always
+    # reflect whatever's newest - the same "just redraw it" approach the
+    # Recent Files/Folders menus already take, rather than trying to keep a
+    # live view in sync.
+    def _start_page_row(parent, icon, primary_text, secondary_text, command):
+        row = tk.Frame(parent, bg=THEME["editor_bg"], cursor="hand2")
+        row.pack(fill="x", pady=1)
+
+        icon_label = tk.Label(
+            row, text=icon, bg=THEME["editor_bg"], fg=THEME["muted_fg"],
+            font=("Segoe UI", 11), width=2
+        )
+        icon_label.pack(side="left", padx=(4, 6))
+
+        text_frame = tk.Frame(row, bg=THEME["editor_bg"])
+        text_frame.pack(side="left", fill="both", expand=True)
+
+        primary = tk.Label(
+            text_frame, text=primary_text, bg=THEME["editor_bg"],
+            fg=THEME["editor_fg"], anchor="w", font=("Segoe UI", 10)
+        )
+        primary.pack(fill="x")
+
+        widgets = [row, icon_label, text_frame, primary]
+        if secondary_text:
+            secondary = tk.Label(
+                text_frame, text=secondary_text, bg=THEME["editor_bg"],
+                fg=THEME["muted_fg"], anchor="w", font=("Segoe UI", 8)
+            )
+            secondary.pack(fill="x")
+            widgets.append(secondary)
+
+        # Hover highlight - every widget in the row swaps together so the
+        # whole row reads as one clickable target, not just whichever
+        # label the mouse happens to be over.
+        def _enter(_event=None):
+            for w in widgets:
+                try:
+                    w.configure(bg=THEME["tree_active_bg"])
+                except tk.TclError:
+                    pass
+
+        def _leave(_event=None):
+            for w in widgets:
+                try:
+                    w.configure(bg=THEME["editor_bg"])
+                except tk.TclError:
+                    pass
+
+        for w in widgets:
+            w.bind("<Enter>", _enter)
+            w.bind("<Leave>", _leave)
+            w.bind("<Button-1>", lambda _e: command())
+
+        return row
+
+    def _populate_start_page():
+        for child in start_page_frame.winfo_children():
+            child.destroy()
+
+        center = tk.Frame(start_page_frame, bg=THEME["editor_bg"])
+        # pack(expand=True) centers on the frame's *actual* rendered size,
+        # unlike place(relx/rely=..., anchor="center") - which pins the
+        # center of a fixed fraction and, if the content turns out taller
+        # than expected, happily shoves the top of it above y=0 and off
+        # the visible frame instead of just centering what's left.
+        center.pack(expand=True)
+
+        tk.Label(
+            center, text=_STARTUP_BANNER.strip("\n"), bg=THEME["editor_bg"], fg=THEME["accent"],
+            # A NEGATIVE font size is pixels, not points - points get run
+            # through Tk's points-per-inch conversion, which scales up
+            # with the display's DPI (see _apply_windows_dpi_awareness -
+            # this app declares itself DPI-aware so Windows hands Tk the
+            # real DPI instead of a virtualized 96). A "6pt" banner could
+            # therefore render several times taller than intended on a
+            # scaled display, blowing this label's height way past the
+            # frame and leaving only its last couple of lines visible.
+            # Pixels sidestep that scaling entirely, so the banner is the
+            # same physical size in every DPI setting.
+            font=("Courier New", -16), justify="left"
+        ).pack(anchor="w")
+
+        tk.Label(
+            center, text="Start something new, or pick up where you left off.",
+            bg=THEME["editor_bg"], fg=THEME["muted_fg"], font=("Segoe UI", 10)
+        ).pack(anchor="w", pady=(4, 24))
+
+        columns = tk.Frame(center, bg=THEME["editor_bg"])
+        columns.pack(fill="both", expand=True)
+
+        start_col = tk.Frame(columns, bg=THEME["editor_bg"])
+        start_col.pack(side="left", anchor="n", padx=(0, 70))
+
+        tk.Label(
+            start_col, text="START", bg=THEME["editor_bg"], fg=THEME["muted_fg"],
+            font=("Segoe UI", 9, "bold")
+        ).pack(anchor="w", pady=(0, 6))
+
+        _start_page_row(start_col, "\U0001F4C4", "New File", "Ctrl+N", new_file)
+        _start_page_row(start_col, "\U0001F4C2", "Open File...", "Ctrl+O", open_file)
+        _start_page_row(start_col, "\U0001F4C1", "Open Folder...", "", open_folder)
+
+        recent_col = tk.Frame(columns, bg=THEME["editor_bg"])
+        recent_col.pack(side="left", anchor="n")
+
+        tk.Label(
+            recent_col, text="RECENT FOLDERS", bg=THEME["editor_bg"], fg=THEME["muted_fg"],
+            font=("Segoe UI", 9, "bold")
+        ).pack(anchor="w", pady=(0, 6))
+
+        recent_folders = recent_folders_state["paths"][:6]
+        if recent_folders:
+            for folder in recent_folders:
+                _start_page_row(
+                    recent_col, "\U0001F4C1", os.path.basename(folder.rstrip("/\\")) or folder,
+                    folder, lambda f=folder: _open_recent_folder(f)
+                )
+        else:
+            tk.Label(
+                recent_col, text="No recent folders", bg=THEME["editor_bg"],
+                fg=THEME["muted_fg"], font=("Segoe UI", 9, "italic")
+            ).pack(anchor="w")
+
+        tk.Label(
+            recent_col, text="RECENT FILES", bg=THEME["editor_bg"], fg=THEME["muted_fg"],
+            font=("Segoe UI", 9, "bold")
+        ).pack(anchor="w", pady=(18, 6))
+
+        recent_files = recent_files_state["paths"][:6]
+        if recent_files:
+            for path in recent_files:
+                _start_page_row(
+                    recent_col, "\U0001F4C4", os.path.basename(path) or path,
+                    path, lambda p=path: _open_recent(p)
+                )
+        else:
+            tk.Label(
+                recent_col, text="No recent files", bg=THEME["editor_bg"],
+                fg=THEME["muted_fg"], font=("Segoe UI", 9, "italic")
+            ).pack(anchor="w")
+
+    def _show_start_page():
+        # Not winfo_ismapped()-gated on purpose: that flag isn't reliable
+        # before the window's ever actually been drawn (the very first
+        # call here happens pre-mainloop, during startup), so it can read
+        # False for a widget that's genuinely packed and about to show.
+        # Trusting it meant tab_control's pack_forget() got skipped on
+        # first launch, leaving an empty notebook visibly stacked above
+        # the Start Page instead of hidden. pack_forget() on an already-
+        # unmanaged widget (and pack() on an already-managed one) are both
+        # harmless no-ops, so there's nothing to gain from checking first.
+        tab_control.pack_forget()
+        _populate_start_page()
+        start_page_frame.pack(fill="both", expand=True)
+
+    def _hide_start_page():
+        start_page_frame.pack_forget()
+        tab_control.pack(fill="both", expand=True)
+
     file_menu.add_command(label="Save", command=save_file, accelerator="Ctrl+S")
     file_menu.add_command(label="Save As", command=save_as_file)
     file_menu.add_separator()
@@ -5243,49 +6503,86 @@ def run():
         save_current_session()
         root.destroy()
 
-    def _switch_theme_and_relaunch(new_theme_name):
-        # Applying a new palette touches colors baked into dozens of widgets
-        # at creation time (editor surfaces, tabs, popups, the terminal...).
-        # Rather than hunt down and re-configure every one of them, we save
-        # the new preference and relaunch the app so it comes up fully
-        # re-themed - same trick VS Code uses for some settings that need a
-        # reload. We still run the normal "unsaved changes?" checks first,
-        # and we save the open files/folder so the relaunch reopens them
-        # instead of coming back up blank.
-        for tab_id in list(tab_editors.keys()):
-            editor = tab_editors.get(tab_id)
-            if editor is None:
-                continue
-            if not prompt_save_if_dirty(editor, tab_id):
-                return
+    def _apply_theme_live(new_theme_name):
+        """Re-themes the whole running app in place - no relaunch, no
+        save-and-reopen dance, and critically no window destroy/recreate,
+        which is what caused the visible minimize/maximize flicker the
+        old relaunch-based switch had.
+
+        Every widget in this app is colored with a literal value pulled
+        from THEME[...] at creation time rather than a live reference, so
+        "switch theme" comes down to two kinds of refresh:
+          - ttk-styled widgets (Treeview, tabs, scrollbars, comboboxes)
+            and Text tag colors (syntax highlighting, current line,
+            brackets, search, line-number glow) aren't reachable through
+            plain widget options at all - those get fixed by re-running
+            the same setup functions that configured them from THEME the
+            first time, now reading the new palette.
+          - every other plain tk widget (the hundreds of Frames/Labels/
+            Buttons/etc. scattered across app.py, git_panel.py, and
+            music_player.py) gets fixed generically: build a map from
+            every old literal color value to its new counterpart, then
+            walk the whole widget tree swapping any matching option.
+        """
+        global THEME_NAME
+        if new_theme_name == THEME_NAME or new_theme_name not in THEMES:
+            return
+
+        old_theme_snapshot = dict(THEME)
+        new_theme = THEMES[new_theme_name]
+        remap = _build_color_remap(old_theme_snapshot, new_theme)
+
+        THEME.clear()
+        THEME.update(new_theme)
+        THEME_NAME = new_theme_name
 
         save_theme_preference(new_theme_name)
-        save_current_session()
-        _flush_session_stats()
+        _apply_windows_dark_titlebar(root, is_dark_theme(new_theme_name))
 
-        # Plain os.execv() here used to inherit the current environment
-        # as-is - harmless when running as a normal .py, but in a
-        # PyInstaller --onefile .exe the culprit is _MEIPASS2: the
-        # bootloader sets that env var so that if a onefile app spawns a
-        # subprocess of *itself*, the child can skip re-extracting and
-        # just reuse the parent's temp extraction folder. Inherited via
-        # execv/Popen, that pointed the relaunched process at a folder
-        # that disappears the moment this process's shutdown finishes
-        # cleaning up after itself - a race that only sometimes lost,
-        # matching the "Tcl data directory ... not found" reports.
-        # (TCL_LIBRARY/TK_LIBRARY aren't actually the problem - the
-        # tkinter runtime hook always overwrites those itself based on
-        # sys._MEIPASS, which is exactly why stripping only those didn't
-        # fix it last time.) Popen+exit (the same pattern "New Window"
-        # already uses) also sidesteps os.execv's flavor of process
-        # replacement, which Windows doesn't natively support anyway.
-        env = os.environ.copy()
-        for var in ("TCL_LIBRARY", "TK_LIBRARY", "_MEIPASS2"):
-            env.pop(var, None)
-        subprocess.Popen([sys.executable] + sys.argv, env=env)
+        # ttk styles, menu popup colors, and the explorer's git/active-file
+        # tag colors all live outside the plain-widget-option world the
+        # generic remap below can reach.
+        _apply_ttk_styles()
+        _apply_project_tree_theme()
+        menu_opts.update({
+            "bg": THEME["panel_header_bg"],
+            "fg": THEME["panel_header_fg"],
+            "activebackground": THEME["editor_select_bg"],
+            "activeforeground": THEME["editor_select_fg"],
+            "disabledforeground": THEME["muted_fg"],
+            "border": THEME["popup_border"],
+        })
+        ThemedMenu.close_all()
+        ThemedMenu.retheme_all(menu_opts)
+        _rebuild_theme_menu()
 
-        root.destroy()
-        sys.exit(0)
+        # Every plain tk widget anywhere in the app (this window, any open
+        # dialogs, the git/music panels, etc.), recolored by literal-value
+        # swap rather than needing each one's creation site touched.
+        root.config(bg=THEME["app_bg"])
+        _remap_widget_colors(root, remap)
+
+        # Text-tag colors aren't widget options, so the generic remap
+        # above can't see them - each open editor pane needs its tag
+        # setup and canvas-drawn overlays (minimap, indent guides, lint
+        # squiggles) redone against the new THEME.
+        for editor in tab_editors.values():
+            setup_highlight_tags(editor["text"])
+            setup_line_number_tags(editor["line_numbers"])
+            highlight_syntax(editor)
+            highlight_current_line(editor)
+            highlight_brackets(editor["text"])
+            update_indent_guides(editor)
+            update_lint_squiggles(editor)
+            render_minimap_content(editor)
+            pane2 = editor.get("pane2")
+            if pane2 is not None:
+                setup_highlight_tags(pane2["text"])
+                setup_line_number_tags(pane2["line_numbers"])
+
+        status_theme_label.config(
+            text="\U0001F3A8 " + THEME_LABELS.get(THEME_NAME, THEME_NAME.title())
+        )
 
     def cycle_theme():
         # Steps to the next theme in THEMES' definition order, wrapping
@@ -5295,12 +6592,12 @@ def run():
         names = list(THEMES.keys())
         idx = names.index(THEME_NAME)
         new_theme_name = names[(idx + 1) % len(names)]
-        _switch_theme_and_relaunch(new_theme_name)
+        _apply_theme_live(new_theme_name)
 
     def set_theme(name):
         if name == THEME_NAME:
             return
-        _switch_theme_and_relaunch(name)
+        _apply_theme_live(name)
 
     # ---------- Zen / distraction-free mode ----------
     # Hides everything but the editor surface itself: menu bar, explorer,
@@ -5468,6 +6765,8 @@ def run():
     edit_menu = ThemedMenu(root, tearoff=0, **menu_opts)
     edit_menu.add_command(label="Find...", command=lambda: open_find_replace("find"), accelerator="Ctrl+F")
     edit_menu.add_command(label="Replace...", command=lambda: open_find_replace("replace"), accelerator="Ctrl+H")
+    edit_menu.add_separator()
+    edit_menu.add_command(label="Toggle Line Comment", command=lambda: toggle_comment(), accelerator="Ctrl+/")
 
     run_menu = ThemedMenu(root, tearoff=0, **menu_opts)
     run_menu.add_command(label="Run", command=run_code, accelerator="F5")
@@ -5501,6 +6800,23 @@ def run():
 
     view_menu.add_command(label="Hide Minimap", command=toggle_minimap, accelerator="Ctrl+M")
     minimap_menu_index = view_menu.index(tk.END)
+
+    view_menu.add_command(
+        label="Enable Word Wrap", command=toggle_word_wrap, accelerator="Alt+Z"
+    )
+    word_wrap_menu_index = view_menu.index(tk.END)
+
+    view_menu.add_separator()
+    view_menu.add_command(
+        label="Split Editor Right", command=lambda: split_editor(), accelerator="Ctrl+\\"
+    )
+    view_menu.add_command(label="Close Split", command=lambda: close_split())
+    view_menu.add_separator()
+    view_menu.add_command(
+        label="Toggle Fold", command=lambda: toggle_fold_at_cursor(), accelerator="Ctrl+Shift+["
+    )
+    view_menu.add_command(label="Fold All", command=lambda: fold_all_current(), accelerator="Ctrl+Alt+[")
+    view_menu.add_command(label="Unfold All", command=lambda: unfold_all_current(), accelerator="Ctrl+Alt+]")
 
     def toggle_git_heatmap():
         git_heatmap_state["visible"] = not git_heatmap_state["visible"]
@@ -5550,13 +6866,18 @@ def run():
     # Theme submenu - one entry per palette in THEMES, with a checkmark
     # next to whichever is currently active. Picking any entry (including
     # the active one, harmlessly - set_theme no-ops on a no-op change)
-    # relaunches the app themed accordingly.
+    # re-themes the app live.
     theme_menu = ThemedMenu(root, tearoff=0, **menu_opts)
-    for theme_name in THEMES:
-        label = THEME_LABELS.get(theme_name, theme_name.replace("_", " ").title())
-        if theme_name == THEME_NAME:
-            label = "\u2713 " + label
-        theme_menu.add_command(label=label, command=lambda n=theme_name: set_theme(n))
+
+    def _rebuild_theme_menu():
+        theme_menu.delete(0, tk.END)
+        for theme_name in THEMES:
+            label = THEME_LABELS.get(theme_name, theme_name.replace("_", " ").title())
+            if theme_name == THEME_NAME:
+                label = "\u2713 " + label
+            theme_menu.add_command(label=label, command=lambda n=theme_name: set_theme(n))
+
+    _rebuild_theme_menu()
     view_menu.add_cascade(label="Theme", menu=theme_menu)
     view_menu.add_command(
         label="Next Theme",
@@ -5569,6 +6890,11 @@ def run():
         command=lambda: open_command_palette(),
         accelerator="Ctrl+Shift+P"
     )
+    view_menu.add_command(
+        label="Go to Line/Symbol...",
+        command=lambda: open_goto(),
+        accelerator="Ctrl+P"
+    )
 
     settings_menu = ThemedMenu(root, tearoff=0, **menu_opts)
     settings_menu.add_command(
@@ -5577,12 +6903,153 @@ def run():
         accelerator="Ctrl+,"
     )
 
+    # ---------------- Plugins ----------------
+    # A basic, best-effort plugin system - see plugins.py for the actual
+    # file discovery/loading and the PluginAPI class docstrings for what
+    # a plugin can do. Everything below is just the app.py side of that
+    # contract: the callables a PluginAPI needs, the Plugins menu itself,
+    # and the on_save/on_open hook lists that save_editor/save_editor_as/
+    # _open_path_in_tab (defined earlier) already call into by name.
+    _plugin_save_callbacks = []
+    _plugin_open_callbacks = []
+    _plugin_commands = []   # [(label, safe_callback), ...] - see _plugin_register_command
+    _plugin_load_results = []  # [{"name", "path", "error"}, ...] - see plugins.load_plugins
+
+    def _notify_plugins_on_save(path, content):
+        for callback in _plugin_save_callbacks:
+            try:
+                callback(path, content)
+            except Exception:
+                # A plugin's own hook misbehaving should never be able to
+                # break the save it's reacting to, or stop any other
+                # plugin's hook in this same list from running - same
+                # "degrade quietly" convention as the rest of the app.
+                # Unlike a menu command the user just clicked on purpose
+                # (see _plugin_register_command below), there's no good
+                # place to surface this to the user, so it's silent.
+                pass
+
+    def _notify_plugins_on_open(path, content):
+        for callback in _plugin_open_callbacks:
+            try:
+                callback(path, content)
+            except Exception:
+                pass
+
+    plugins_menu = ThemedMenu(root, tearoff=0, **menu_opts)
+
+    def _open_plugins_folder():
+        plugins.ensure_plugin_dir()
+        reveal_in_file_explorer(plugins.PLUGIN_DIR)
+
+    def _show_plugin_errors():
+        errors = [r for r in _plugin_load_results if r["error"]]
+        if not errors:
+            messagebox.showinfo("Plugin Errors", "No plugin errors - everything loaded cleanly.")
+            return
+        win = tk.Toplevel(root)
+        win.title("Plugin Errors")
+        win.geometry("700x400")
+        win.config(bg=THEME["output_bg"])
+        box = tk.Text(
+            win, wrap="word", bg=THEME["output_bg"], fg=THEME["output_fg"],
+            insertbackground=THEME["output_fg"], relief="flat", padx=10, pady=10,
+        )
+        box.pack(fill="both", expand=True)
+        text = "\n\n".join(f"{r['name']} ({r['path']}):\n{r['error']}" for r in errors)
+        box.insert("1.0", text)
+        box.config(state="disabled")
+
+    def _plugin_register_command(label, callback):
+        def safe_callback(cb=callback, label=label):
+            try:
+                cb()
+            except Exception:
+                # Unlike on_save/on_open hooks (which fire in the
+                # background, unasked, as a side effect of something
+                # else), this only runs when the user deliberately picked
+                # the command - so a failure here is worth telling them
+                # about rather than swallowing silently.
+                messagebox.showerror(
+                    "Plugin Error",
+                    f"'{label}' raised an error:\n\n{traceback.format_exc()}"
+                )
+        _plugin_commands.append((label, safe_callback))
+
+    def _plugin_get_current_text():
+        editor = get_current_editor()
+        return editor["text"].get("1.0", "end-1c") if editor else None
+
+    def _plugin_get_current_path():
+        editor = get_current_editor()
+        return editor["path"] if editor else None
+
+    def _plugin_insert_text(text):
+        editor = get_current_editor()
+        if editor:
+            editor["text"].insert("insert", text)
+
+    def _plugin_get_theme():
+        return dict(THEME)
+
+    plugin_api = plugins.PluginAPI(
+        register_command=_plugin_register_command,
+        add_on_save=_plugin_save_callbacks.append,
+        add_on_open=_plugin_open_callbacks.append,
+        get_current_text=_plugin_get_current_text,
+        get_current_path=_plugin_get_current_path,
+        insert_text=_plugin_insert_text,
+        show_message=show_status_message,
+        get_theme=_plugin_get_theme,
+    )
+
+    def _rebuild_plugins_menu():
+        plugins_menu.delete(0, tk.END)
+        plugins_menu.add_command(label="Open Plugins Folder", command=_open_plugins_folder)
+        plugins_menu.add_command(label="Reload Plugins", command=_reload_plugins)
+        error_count = sum(1 for r in _plugin_load_results if r["error"])
+        if error_count:
+            plugins_menu.add_command(
+                label=f"Show Plugin Errors ({error_count})...",
+                command=_show_plugin_errors,
+            )
+        if _plugin_commands or error_count:
+            plugins_menu.add_separator()
+        for label, safe_callback in _plugin_commands:
+            plugins_menu.add_command(label=label, command=safe_callback)
+        for result in _plugin_load_results:
+            if result["error"]:
+                plugins_menu.add_command(
+                    label=f"\u26A0 {result['name']} (failed to load)", state="disabled"
+                )
+
+    def _load_all_plugins():
+        # Rebuilding these from scratch (rather than trying to diff old
+        # vs. new) keeps Reload Plugins simple and always correct, the
+        # same reasoning refresh_tree() uses for the explorer - the only
+        # cost is that a plugin's on_save/on_open registrations and menu
+        # commands all get re-registered from a clean slate every time,
+        # which is exactly what "reload" should do anyway.
+        _plugin_commands.clear()
+        _plugin_save_callbacks.clear()
+        _plugin_open_callbacks.clear()
+        _plugin_load_results.clear()
+        _plugin_load_results.extend(plugins.load_plugins(plugin_api))
+        _rebuild_plugins_menu()
+
+    def _reload_plugins():
+        _load_all_plugins()
+        show_status_message(f"Reloaded plugins ({len(_plugin_load_results)} found).")
+
+    _load_all_plugins()
+
     for label, dropdown in (
         ("File", file_menu),
         ("Edit", edit_menu),
         ("Run", run_menu),
         ("View", view_menu),
         ("Settings", settings_menu),
+        ("Plugins", plugins_menu),
     ):
         _make_menu_launcher(menu_bar_frame, label, dropdown).pack(side="left")
 
@@ -5596,6 +7063,7 @@ def run():
     root.bind("<Control-k>", lambda e: clear_output())
     root.bind("<Control-f>", lambda e: open_find_replace("find"))
     root.bind("<Control-h>", lambda e: open_find_replace("replace"))
+    root.bind("<Control-p>", lambda e: open_goto())
     root.bind("<Control-grave>", lambda e: open_external_terminal())
     root.bind("<Control-comma>", lambda e: open_settings_dialog())
     root.bind("<Control-Shift-D>", lambda e: cycle_theme())
@@ -5606,6 +7074,12 @@ def run():
     root.bind("<Control-minus>", lambda e: zoom_out())
     root.bind("<Control-KP_Subtract>", lambda e: zoom_out())
     root.bind("<Control-0>", lambda e: zoom_reset())
+    root.bind("<Alt-z>", lambda e: toggle_word_wrap())
+    root.bind("<Alt-Z>", lambda e: toggle_word_wrap())
+    root.bind("<Control-backslash>", lambda e: split_editor())
+    root.bind("<Control-Shift-bracketleft>", lambda e: toggle_fold_at_cursor())
+    root.bind("<Control-Alt-bracketleft>", lambda e: fold_all_current())
+    root.bind("<Control-Alt-bracketright>", lambda e: unfold_all_current())
     root.bind("<Control-KP_0>", lambda e: zoom_reset())
     root.bind("<Control-m>", lambda e: toggle_minimap())
     root.bind("<Control-Shift-Z>", lambda e: toggle_zen_mode())
@@ -5663,7 +7137,7 @@ def run():
         for prefix, menu in (
             ("File", file_menu), ("Edit", edit_menu),
             ("Run", run_menu), ("View", view_menu),
-            ("Settings", settings_menu),
+            ("Settings", settings_menu), ("Plugins", plugins_menu),
         ):
             commands.extend(_collect_menu_commands(menu, prefix=prefix + ": "))
         return commands
@@ -5838,6 +7312,226 @@ def run():
         # yet - deferring one tick makes sure it lands.
         win.after(10, entry.focus_set)
 
+    # ---------- Go to Line / Symbol ----------
+    # Same overrideredirect popup + fuzzy-score-and-filter shape as the
+    # Command Palette above, just pointed at a different list: symbols
+    # parsed out of the current file (via goto.extract_symbols) instead
+    # of menu commands. A query that's just digits (optionally prefixed
+    # with ":", so ":42" also works like most editors' goto-line
+    # shortcut) jumps straight to that line number instead of fuzzy-
+    # matching symbol names - the two modes share one popup rather than
+    # needing a separate dialog each, since "jump somewhere in this file"
+    # is really one feature with two ways of describing the destination.
+    goto_state = {"window": None, "entry": None, "listbox": None,
+                  "symbols": [], "filtered": []}
+
+    def _goto_line_count():
+        editor = get_current_editor()
+        if not editor:
+            return 1
+        try:
+            return int(editor["text"].index("end-1c").split(".")[0])
+        except tk.TclError:
+            return 1
+
+    def _jump_to_line(line, editor=None):
+        editor = editor or get_current_editor()
+        if not editor:
+            return
+        text_area = editor["text"]
+        # A leftover multi-cursor selection from before Goto was opened
+        # would otherwise keep intercepting every keystroke (see the <Key>
+        # binding in bind_multicursor) and inserting at those old
+        # positions instead of the line just jumped to - clicking
+        # elsewhere in the editor already clears this (see on_click), so
+        # jumping via Goto should too.
+        mc = editor.get("multi_cursor")
+        if mc and mc.get("clear"):
+            mc["clear"]()
+        max_line = _goto_line_count()
+        line = min(max(1, line), max_line)
+        index = f"{line}.0"
+        text_area.mark_set("insert", index)
+        text_area.see(index)
+        # Center-ish rather than just "on screen" - a line freshly jumped
+        # to via this popup is the thing the person is about to look at
+        # in detail, not just something scrolled past, so it's worth the
+        # extra half-page nudge over a bare .see().
+        text_area.update_idletasks()
+        try:
+            text_area.yview(f"{index} -{text_area.winfo_height() // 40} lines")
+        except tk.TclError:
+            pass
+        # focus_set() only updates Tk's internal bookkeeping of which
+        # widget should have focus - it assumes the containing toplevel
+        # already has real OS-level keyboard focus. The Goto popup is an
+        # overrideredirect() window (no window-manager decoration), and
+        # those are notorious for leaving the OS's actual keyboard focus
+        # stranded on them (or on nothing) even after being destroyed, so
+        # focus_set() alone can leave the editor with no visible/blinking
+        # cursor and no way to type - focus_force() forces real input
+        # focus back, not just Tk's internal notion of it.
+        text_area.focus_force()
+        fun_effects.cursor_pulse(text_area, index, THEME["accent"], THEME["editor_bg"])
+
+    def _filter_goto(*_args):
+        query = goto_state["entry"].get().strip()
+        listbox = goto_state["listbox"]
+        listbox.delete(0, tk.END)
+
+        stripped = query[1:] if query.startswith(":") else query
+        if stripped.isdigit():
+            goto_state["filtered"] = [("line", int(stripped), None)]
+            listbox.insert(tk.END, f"Go to line {stripped}")
+            listbox.selection_set(0)
+            return
+
+        if not query and not goto_state["symbols"]:
+            goto_state["filtered"] = []
+            listbox.insert(tk.END, "(no symbols in this file - type a line number)")
+            return
+
+        scored = []
+        for sym in goto_state["symbols"]:
+            score = _fuzzy_score(query, sym["name"])
+            if score is not None:
+                scored.append((score, sym))
+        scored.sort(key=lambda t: (t[0], t[1]["line"]))
+
+        filtered = []
+        for _, sym in scored[:200]:
+            label = ("  " * sym["indent"]) + f"{sym['kind']} {sym['name']}" + f"   :{sym['line']}"
+            listbox.insert(tk.END, label)
+            filtered.append(("symbol", sym["line"], sym))
+        goto_state["filtered"] = filtered
+        if filtered:
+            listbox.selection_set(0)
+
+    def close_goto_popup():
+        win = goto_state["window"]
+        if win is not None and win.winfo_exists():
+            win.destroy()
+        goto_state["window"] = None
+        # Escape / click-away destroy the popup without ever landing focus
+        # back on the editor, leaving typing (and the blinking cursor)
+        # dead - and since this popup is an overrideredirect() window,
+        # destroying it doesn't reliably hand real OS keyboard focus back
+        # to the main window on its own. focus_force() (not focus_set())
+        # reclaims actual input focus so every dismissal path (Escape,
+        # focus-out, and a real selection) ends up back in the editor.
+        editor = get_current_editor()
+        if editor and editor["text"].winfo_exists():
+            editor["text"].focus_force()
+
+    def _goto_selected(event=None):
+        listbox = goto_state["listbox"]
+        selection = listbox.curselection()
+        if not selection:
+            return "break"
+        _, line, _ = goto_state["filtered"][selection[0]]
+        close_goto_popup()
+        root.after(10, lambda: _jump_to_line(line))
+        return "break"
+
+    def _goto_focus_out(event, win):
+        def check(win=win):
+            if goto_state["window"] is not win or not win.winfo_exists():
+                return
+            if time.time() - goto_state.get("opened_at", 0) < 0.25:
+                return
+            focused = root.focus_get()
+            if focused is None or not str(focused).startswith(str(win)):
+                close_goto_popup()
+        win.after(80, check)
+
+    def open_goto():
+        editor = get_current_editor()
+        if not editor:
+            return
+
+        existing = goto_state["window"]
+        if existing is not None and existing.winfo_exists():
+            goto_state["entry"].focus_force()
+            return
+
+        win = tk.Toplevel(root)
+        win.overrideredirect(True)
+        win.config(bg=THEME["border"])
+        win.transient(root)
+
+        frame = tk.Frame(win, bg=THEME["popup_bg"])
+        frame.pack(padx=1, pady=1, fill="both", expand=True)
+
+        entry = tk.Entry(
+            frame, font=("Consolas", 12),
+            bg=THEME["popup_bg"], fg=THEME["popup_fg"],
+            insertbackground=THEME["popup_fg"],
+            relief="flat", highlightthickness=0, bd=0,
+        )
+        entry.pack(fill="x", padx=10, pady=8)
+
+        listbox = tk.Listbox(
+            frame, bg=THEME["popup_bg"], fg=THEME["popup_fg"],
+            selectbackground=THEME["popup_select_bg"], selectforeground=THEME["popup_select_fg"],
+            relief="flat", highlightthickness=0, activestyle="none",
+            height=12, font=("Consolas", 10),
+        )
+        listbox.pack(fill="both", expand=True, padx=1, pady=(0, 1))
+
+        symbols = goto.extract_symbols(editor.get("path"), editor["text"].get("1.0", "end-1c"))
+        goto_state.update({
+            "window": win, "entry": entry, "listbox": listbox,
+            "symbols": symbols, "filtered": [],
+            "opened_at": time.time(),
+        })
+
+        def _position_goto():
+            if not win.winfo_exists():
+                return
+            win.update_idletasks()
+            w, h = 480, 320
+            x = root.winfo_rootx() + max(0, (root.winfo_width() - w) // 2)
+            y = root.winfo_rooty() + max(0, int(root.winfo_height() * 0.12))
+            win.geometry(f"{w}x{h}+{x}+{y}")
+
+        _position_goto()
+        win.lift()
+        win.attributes("-topmost", True)
+        win.after(10, _position_goto)
+
+        def on_entry_key(event):
+            if event.keysym in ("Up", "Down", "Return", "Escape"):
+                return
+            _filter_goto()
+
+        def _move_goto_selection(delta):
+            size = listbox.size()
+            if size == 0:
+                return
+            current = listbox.curselection()
+            i = current[0] if current else -1
+            i = min(max(i + delta, 0), size - 1)
+            listbox.selection_clear(0, tk.END)
+            listbox.selection_set(i)
+            listbox.see(i)
+
+        entry.bind("<KeyRelease>", on_entry_key)
+        entry.bind("<Down>", lambda e: (_move_goto_selection(1), "break")[1])
+        entry.bind("<Up>", lambda e: (_move_goto_selection(-1), "break")[1])
+        entry.bind("<Return>", _goto_selected)
+        entry.bind("<Escape>", lambda e: close_goto_popup())
+        listbox.bind("<Double-Button-1>", _goto_selected)
+        win.bind("<FocusOut>", lambda e, w=win: _goto_focus_out(e, w))
+
+        _filter_goto()
+        # focus_set() assumes the popup's toplevel already has real OS
+        # keyboard focus - for an overrideredirect() window like this one,
+        # that's not guaranteed, and without it the popup can end up
+        # never actually receiving keystrokes (and the focus-out check
+        # above can then see focus as having left immediately and close
+        # the popup on its own). focus_force() claims real input focus.
+        win.after(10, entry.focus_force)
+
     # ---------- Media keys ----------
     # Lets you control the Music tab without switching to it. Real hardware
     # media keys (XF86Audio*) work in Tk on Linux and some Windows builds,
@@ -5870,7 +7564,8 @@ def run():
     # Bring back whatever folder/files were open last time (including right
     # after a dark-mode restart, so toggling never looks like it lost work).
     # A window opened via File > New Window is the one exception - it's
-    # meant to start blank alongside whatever's already open, not clone it.
+    # meant to start fresh alongside whatever's already open (the Start
+    # Page below), not clone it.
     is_new_window = os.environ.get("CODEFORGE_NEW_WINDOW") == "1"
     session = {} if is_new_window else load_session()
     restored_any = False
@@ -5893,7 +7588,7 @@ def run():
         restored_any = True
 
     if not restored_any:
-        create_tab()
+        _show_start_page()
     else:
         active_path = session.get("active_path")
         active_tab = find_tab_for_path(active_path) if active_path else None
@@ -5902,6 +7597,19 @@ def run():
         highlight_active_file()
 
     _tick_session_timer()
+
+    # ---------------- Fun extras: easter egg + idle mascot ----------------
+    def _konami_triggered():
+        status_streak_label.config(text="\U0001F389 KONAMI!")
+        root.after(3000, lambda: status_streak_label.config(text=streak_tracker.display()))
+
+    fun_effects.install_konami_code(root, _konami_triggered)
+
+    def _idle_mascot_target():
+        ed = get_current_editor()
+        return ed["editor_frame"] if ed else None
+
+    fun_effects.install_idle_mascot(root, _idle_mascot_target, THEME)
 
     root.mainloop()
 
